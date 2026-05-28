@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "sum-insured-impact-react",
+  "name": "sum-insur",
   "compatibility_date": "2026-05-28",
   "assets": {
     "directory": "./dist",
