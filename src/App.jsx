@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import readExcelFile from "read-excel-file/browser";
 import {
   DEFAULT_COPAY_DASHBOARD_CONFIG,
   DEFAULT_CAPPED_AILMENT_DASHBOARD_CONFIG,
@@ -13,7 +14,29 @@ import {
   mapRowsToObjects,
   normalizeKey,
   parseCSV,
+  workbookSheetsToCSV,
 } from "./lib";
+import {
+  BENEFICIARY_FIELD_DEFS,
+  BENEFICIARY_FIELD_KEYS,
+  CAPPED_AILMENT_FIELD_DEFS,
+  CAPPED_AILMENT_FIELD_KEYS,
+  CLAIM_FIELD_KEYS,
+  COPAY_CLAIM_FIELD_DEFS,
+  HEADER_SCAN_LIMIT,
+  ICD_FIELD_DEFS,
+  ICD_FIELD_KEYS,
+  MATERNITY_FIELD_DEFS,
+  MATERNITY_FIELD_KEYS,
+  ROOM_RENT_FIELD_DEFS,
+  ROOM_RENT_FIELD_KEYS,
+  SUM_INSURED_FIELD_DEFS,
+  buildDefaultMapping,
+  findHeaderRow,
+  getPreviewRowValidation,
+  prepareRowsForFieldMapping,
+} from "./headerMappings";
+import { DEFAULT_ICD_LOOKUP_ROWS } from "./icdDefaults";
 
 const SUM_INSURED_SAMPLE = `Employee ID,Claim Status,Current Sum Insured,Claimed Amount,Incurred Amount
 722489,Settled,500000,771001,465732
@@ -44,10 +67,26 @@ Father-In-Law,PARENTS,Parent,Parent IL
 Mother-In-Law,PARENTS,Parent,Parent IL
 Mother-in-law,PARENTS,Parent,Parent IL`;
 
-const ICD_AILMENT_SAMPLE = `ICD Prefix,Category,Ailment
-H25,Ophthalmology,Eye
-J11,Respiratory,Flu
-M54,Orthopedic,Back Pain`;
+const DEFAULT_ICD_AILMENT_SAMPLE_PREFIXES = new Set([
+  "H25",
+  "K40",
+  "M17",
+  "O82",
+  "S22",
+  "U07",
+]);
+
+const ICD_AILMENT_SAMPLE = [
+  ["ICD Prefix", "Category", "Ailment"],
+  ...DEFAULT_ICD_LOOKUP_ROWS
+    .filter((row) => DEFAULT_ICD_AILMENT_SAMPLE_PREFIXES.has(row.icdPrefix))
+    .map((row) => [row.icdPrefix, row.category, row.ailment]),
+].map((row) => row.map(escapeCSVCell).join(",")).join("\n");
+
+const KNOWN_ICD_AILMENT_GROUPS = new Set(
+  DEFAULT_ICD_LOOKUP_ROWS.map((row) => normalizeKey(row.ailment)).filter(Boolean),
+);
+const BUILT_IN_ICD_MAPPING_COUNT = DEFAULT_ICD_LOOKUP_ROWS.length;
 
 const MATERNITY_CLAIM_SAMPLE = `employee_code,Proc Type,Proc Limit,ARG Claimed Amount,ARG Incurred Amount,ARG Status1,ARG Ailment
 EMP001,C-Section,100000,169836,100000,Settled,Maternity
@@ -97,352 +136,12 @@ const TAB_OPTIONS = [
     label: "Capped Ailment",
     description: "Group settled capped ailments and calculate impact by procedure type.",
   },
-];
-
-const SUM_INSURED_FIELD_DEFS = SUM_INSURED_REQUIRED.map((label) => ({
-  key: label,
-  label,
-  required: true,
-  aliases: [label],
-}));
-
-const COPAY_CLAIM_FIELD_DEFS = [
   {
-    key: "sumInsured",
-    label: "Sum Insured",
-    required: true,
-    aliases: ["Sum Insured", "Insured Amount", "SumInsured"],
-  },
-  {
-    key: "relationship",
-    label: "Relationship",
-    required: true,
-    aliases: ["ARG Relation", "Relationship", "Beneficiary Type"],
-  },
-  {
-    key: "age",
-    label: "Age",
-    required: true,
-    aliases: ["ARG Age", "Age"],
-  },
-  {
-    key: "claimedAmount",
-    label: "Claimed Amount",
-    required: true,
-    aliases: ["ARG Claimed Amount", "Claimed Amount"],
-  },
-  {
-    key: "incurredAmount",
-    label: "Incurred Amount",
-    required: true,
-    aliases: ["ARG Incurred Amount", "Incurred Amount", "IncurredAmount"],
-  },
-  {
-    key: "claimType",
-    label: "Claim Type",
-    required: true,
-    aliases: ["ARG Claim Type", "Claim Type"],
-  },
-  {
-    key: "admissionType",
-    label: "Admission Type",
-    required: true,
-    aliases: ["IPD/OPD", "Admission Type"],
-  },
-  {
-    key: "claimStatus",
-    label: "Claim Status",
-    required: true,
-    aliases: ["ARG Status", "Claim Status"],
-  },
-  {
-    key: "settlementStatus",
-    label: "Settlement Status",
-    required: true,
-    aliases: ["ARG Status1", "Settlement Status"],
-  },
-  {
-    key: "icdCode",
-    label: "ICD Code",
-    required: true,
-    aliases: ["ARG ICD", "ICD Code", "ICD"],
-  },
-  {
-    key: "procedureType",
-    label: "Procedure Type",
-    required: true,
-    aliases: ["Proc Type", "Procedure Type"],
-  },
-  {
-    key: "procedureLimit",
-    label: "Procedure Limit",
-    required: true,
-    aliases: ["Proc Limit", "Procedure Limit"],
-  },
-  {
-    key: "grade",
-    label: "Grade",
-    required: false,
-    aliases: ["Grade"],
-  },
-  {
-    key: "policyNumber",
-    label: "Policy Number",
-    required: true,
-    aliases: ["policy_no", "Policy Number"],
-  },
-  {
-    key: "clientName",
-    label: "Client Name",
-    required: true,
-    aliases: ["mph_name", "Client Name", "MPH Name"],
-  },
-  {
-    key: "riskStartDate",
-    label: "Risk Start Date",
-    required: true,
-    aliases: ["risk_inc_date", "Risk Start Date"],
-  },
-  {
-    key: "riskEndDate",
-    label: "Risk End Date",
-    required: true,
-    aliases: ["risk_exp_date", "Risk End Date"],
-  },
-  {
-    key: "employeeCode",
-    label: "Employee Code",
-    required: true,
-    aliases: ["employee_code", "Employee Code"],
+    id: "configuration",
+    label: "Configuration",
+    description: "Manage shared lookup tables and mapping overrides.",
   },
 ];
-
-const BENEFICIARY_FIELD_DEFS = [
-  {
-    key: "beneficiaryType",
-    label: "Beneficiary Type",
-    required: true,
-    aliases: ["Beneficiary Type", "beneficiaryType"],
-  },
-  {
-    key: "beneficiaryTypeGroup1",
-    label: "Beneficiary Type Group1",
-    required: false,
-    aliases: ["Beneficiary Type Group1", "beneficiaryTypeGroup1"],
-  },
-  {
-    key: "beneficiaryTypeGroup2",
-    label: "Beneficiary Type Group2",
-    required: true,
-    aliases: ["Beneficiary Type Group2", "beneficiaryTypeGroup2"],
-  },
-  {
-    key: "beneficiaryTypeGroup",
-    label: "Beneficiary Type Group",
-    required: false,
-    aliases: ["Beneficiary Type Group", "beneficiaryTypeGroup"],
-  },
-];
-
-const ICD_FIELD_DEFS = [
-  {
-    key: "icdPrefix",
-    label: "ICD Prefix",
-    required: true,
-    aliases: ["ICD Prefix", "icdPrefix"],
-  },
-  {
-    key: "ailment",
-    label: "Ailment",
-    required: true,
-    aliases: ["Ailment", "ailment"],
-  },
-];
-
-const MATERNITY_FIELD_DEFS = [
-  {
-    key: "employeeCode",
-    label: "Employee Code",
-    required: true,
-    aliases: ["employee_code", "Employee Code", "employeeCode"],
-  },
-  {
-    key: "procedureType",
-    label: "Procedure Type",
-    required: true,
-    aliases: ["Proc Type", "Procedure Type", "procType"],
-  },
-  {
-    key: "procedureLimit",
-    label: "Procedure Limit",
-    required: true,
-    aliases: ["Proc Limit", "Procedure Limit", "procLimit"],
-  },
-  {
-    key: "claimedAmount",
-    label: "Claimed Amount",
-    required: true,
-    aliases: [
-      "ARG Claimed Amount",
-      "Claimed Amount",
-      "Sum of ARG Claimed Amount",
-    ],
-  },
-  {
-    key: "incurredAmount",
-    label: "Incurred Amount",
-    required: true,
-    aliases: [
-      "ARG Incurred Amount",
-      "Incurred Amount",
-      "Sum of ARG Incurred Amount",
-    ],
-  },
-  {
-    key: "settlementStatus",
-    label: "Settlement Status",
-    required: true,
-    aliases: ["ARG Status1", "Settlement Status", "Status1"],
-  },
-  {
-    key: "ailment",
-    label: "Ailment",
-    required: false,
-    aliases: ["ARG Ailment", "Ailment", "ailment"],
-  },
-];
-
-const ROOM_RENT_FIELD_DEFS = [
-  {
-    key: "employeeCode",
-    label: "Employee Code",
-    required: true,
-    aliases: ["employee_code", "Employee Code", "employeeCode"],
-  },
-  {
-    key: "sumInsured",
-    label: "Sum Insured",
-    required: true,
-    aliases: ["Sum Insured", "Insured Amount", "sumInsured"],
-  },
-  {
-    key: "settlementStatus",
-    label: "Settlement Status",
-    required: true,
-    aliases: ["ARG Status1", "Settlement Status", "Status1"],
-  },
-  {
-    key: "roomCategory",
-    label: "Room Category",
-    required: false,
-    aliases: [
-      "Room Category",
-      "Room Type",
-      "ICU / Normal",
-      "roomCategory",
-    ],
-  },
-  {
-    key: "icuFlag",
-    label: "ICU Flag",
-    required: false,
-    aliases: ["ICU Flag", "ICU/Normal", "icuFlag"],
-  },
-  {
-    key: "roomRentAmount",
-    label: "Room Rent Amount",
-    required: false,
-    aliases: [
-      "Room Rent Amount",
-      "Room Rent Claimed",
-      "Total Room Rent Claimed",
-      "Total Room Rent Paid",
-    ],
-  },
-  {
-    key: "roomRentPerDay",
-    label: "Room Rent Per Day",
-    required: false,
-    aliases: [
-      "Room Rent Per Day",
-      "Per Day Room Rent",
-      "Daily Room Rent",
-    ],
-  },
-  {
-    key: "roomDays",
-    label: "Room Days",
-    required: false,
-    aliases: [
-      "Room Days",
-      "No. of Days",
-      "Normal Room Days",
-      "ICU Days",
-    ],
-  },
-];
-
-const CAPPED_AILMENT_FIELD_DEFS = [
-  {
-    key: "employeeCode",
-    label: "Employee Code",
-    required: true,
-    aliases: ["employee_code", "Employee Code", "employeeCode"],
-  },
-  {
-    key: "procedureType",
-    label: "Procedure Type",
-    required: true,
-    aliases: ["Proc Type", "Procedure Type", "procType"],
-  },
-  {
-    key: "procedureLimit",
-    label: "Procedure Limit",
-    required: true,
-    aliases: ["Proc Limit", "Procedure Limit", "procLimit", "Limit"],
-  },
-  {
-    key: "claimedAmount",
-    label: "Claimed Amount",
-    required: true,
-    aliases: [
-      "ARG Claimed Amount",
-      "Claimed Amount",
-      "Sum of ARG Claimed Amount",
-    ],
-  },
-  {
-    key: "incurredAmount",
-    label: "Incurred Amount",
-    required: true,
-    aliases: [
-      "ARG Incurred Amount",
-      "Incurred Amount",
-      "Sum of ARG Incurred Amount",
-    ],
-  },
-  {
-    key: "settlementStatus",
-    label: "Settlement Status",
-    required: true,
-    aliases: ["ARG Status1", "Settlement Status", "Status1"],
-  },
-  {
-    key: "ailment",
-    label: "Ailment",
-    required: false,
-    aliases: ["ARG Ailment", "Ailment", "ailment"],
-  },
-];
-
-const CLAIM_FIELD_KEYS = COPAY_CLAIM_FIELD_DEFS.map((field) => field.key);
-const BENEFICIARY_FIELD_KEYS = BENEFICIARY_FIELD_DEFS.map((field) => field.key);
-const ICD_FIELD_KEYS = ICD_FIELD_DEFS.map((field) => field.key);
-const MATERNITY_FIELD_KEYS = MATERNITY_FIELD_DEFS.map((field) => field.key);
-const ROOM_RENT_FIELD_KEYS = ROOM_RENT_FIELD_DEFS.map((field) => field.key);
-const CAPPED_AILMENT_FIELD_KEYS = CAPPED_AILMENT_FIELD_DEFS.map(
-  (field) => field.key,
-);
 
 const DEFAULT_COPAY_DASHBOARD_FORM = {
   ESC: {
@@ -565,27 +264,27 @@ function downloadCSVFile(filename, headers, rows) {
   URL.revokeObjectURL(url);
 }
 
-function buildDefaultMapping(headers, fieldDefs, currentMapping) {
-  const normalizedHeaderMap = new Map(
-    headers.map((header) => [normalizeKey(header), header]),
-  );
-  const next = {};
+function isXlsxFile(file) {
+  return String(file?.name || "").toLowerCase().endsWith(".xlsx");
+}
 
-  fieldDefs.forEach((field) => {
-    if (currentMapping[field.key] && headers.includes(currentMapping[field.key])) {
-      next[field.key] = currentMapping[field.key];
-      return;
-    }
+function buildRequiredExample(fieldDefs, sampleRows) {
+  const sampleHeaders = sampleRows[0] || [];
+  const sampleValues = sampleRows[1] || [];
+  const sampleMapping = buildDefaultMapping(sampleHeaders, fieldDefs, {});
 
-    const candidates = [field.label, field.key, ...(field.aliases || [])];
-    const match = candidates.find((candidate) =>
-      normalizedHeaderMap.has(normalizeKey(candidate)),
-    );
+  return fieldDefs
+    .filter((field) => field.required)
+    .map((field) => {
+      const header = sampleMapping[field.key] || field.label;
+      const headerIndex = sampleHeaders.indexOf(header);
 
-    next[field.key] = match ? normalizedHeaderMap.get(normalizeKey(match)) : "";
-  });
-
-  return next;
+      return {
+        key: field.key,
+        header,
+        value: headerIndex >= 0 ? sampleValues[headerIndex] || "" : "",
+      };
+    });
 }
 
 function getFieldOption(field) {
@@ -598,6 +297,245 @@ function getFieldOption(field) {
 function getFieldOrderIndex(fieldDefs, fieldKey) {
   const index = fieldDefs.findIndex((field) => field.key === fieldKey);
   return index === -1 ? fieldDefs.length : index;
+}
+
+function formatCount(value) {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+function looksLikeNumberText(value) {
+  return /^-?[\d,]+(?:\.\d+)?$/.test(String(value ?? "").trim());
+}
+
+function isSumInsuredHeaderRow(row) {
+  return (
+    Array.isArray(row) &&
+    row.length >= SUM_INSURED_REQUIRED.length &&
+    SUM_INSURED_REQUIRED.every(
+      (header, index) => normalizeKey(row[index]) === normalizeKey(header),
+    )
+  );
+}
+
+function isSumInsuredExcelExportRow(row) {
+  return (
+    Array.isArray(row) &&
+    (row.length === 4 || row.length === 5) &&
+    String(row[0] ?? "").trim() !== "" &&
+    row.slice(1).every(looksLikeNumberText)
+  );
+}
+
+function normalizeSumInsuredPasteText(text, defaultStatus = "Settled") {
+  const normalizedByHeader = normalizeRowsFromDetectedHeaders({
+    text,
+    fieldDefs: SUM_INSURED_FIELD_DEFS,
+    outputColumns: [
+      { key: "Employee ID", fallback: "" },
+      { key: "Claim Status", fallback: defaultStatus },
+      { key: "Current Sum Insured", fallback: "" },
+      { key: "Claimed Amount", fallback: "" },
+      { key: "Incurred Amount", fallback: "" },
+    ],
+  });
+
+  if (normalizedByHeader) {
+    return normalizedByHeader;
+  }
+
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0);
+
+  if (lines.length === 0) return "";
+
+  const normalizedRows = [];
+  let hasHeader = false;
+  let hasStarted = false;
+
+  lines.forEach((line) => {
+    const row = parseCSV(line)[0] || [];
+    if (row.length === 0) return;
+
+    if (isSumInsuredHeaderRow(row)) {
+      if (!hasHeader) {
+        normalizedRows.push([...SUM_INSURED_REQUIRED]);
+        hasHeader = true;
+      }
+      hasStarted = true;
+      return;
+    }
+
+    if (isSumInsuredExcelExportRow(row)) {
+      if (!hasHeader) {
+        normalizedRows.push([...SUM_INSURED_REQUIRED]);
+        hasHeader = true;
+      }
+
+      hasStarted = true;
+      normalizedRows.push([row[0], defaultStatus, row[1], row[2], row[3]]);
+      return;
+    }
+
+    if (hasStarted) {
+      normalizedRows.push(row);
+    }
+  });
+
+  return serializeRows(normalizedRows);
+}
+
+function normalizeRowsFromDetectedHeaders({ text, fieldDefs, outputColumns }) {
+  const rows = parseCSV(String(text || ""));
+  if (rows.length === 0) return "";
+
+  const headerMatch = findHeaderRow(rows, fieldDefs, HEADER_SCAN_LIMIT);
+  if (!headerMatch.found) return "";
+
+  const headers = headerMatch.headers || [];
+  const mapping = buildDefaultMapping(headers, fieldDefs, {});
+  const canBuildRows = outputColumns.every(
+    (column) => mapping[column.key] || column.fallback !== undefined,
+  );
+
+  if (!canBuildRows) return "";
+
+  const normalizedRows = [
+    outputColumns.map((column) => {
+      const field = fieldDefs.find((candidate) => candidate.key === column.key);
+      return field?.label || column.key;
+    }),
+  ];
+  const sourceRows = rows.slice(headerMatch.headerRowIndex + 1);
+
+  sourceRows.forEach((row) => {
+    if (!Array.isArray(row) || row.every((cell) => String(cell ?? "").trim() === "")) {
+      return;
+    }
+
+    normalizedRows.push(
+      outputColumns.map((column) => {
+        const sourceHeader = mapping[column.key];
+        const sourceIndex = sourceHeader ? headers.indexOf(sourceHeader) : -1;
+
+        if (sourceIndex >= 0) {
+          return row[sourceIndex] ?? "";
+        }
+
+        return column.fallback ?? "";
+      }),
+    );
+  });
+
+  return serializeRows(normalizedRows);
+}
+
+function looksLikeIcdCode(value) {
+  return /^[A-Z]\d{2}(?:[A-Z0-9.]*)?$/i.test(String(value ?? "").trim());
+}
+
+function repairLooseIcdRow(row) {
+  if (!Array.isArray(row) || row.length <= 3 || !looksLikeIcdCode(row[0])) {
+    return row;
+  }
+
+  const ailmentIndex = row.findIndex(
+    (cell, index) =>
+      index > 0 && KNOWN_ICD_AILMENT_GROUPS.has(normalizeKey(cell)),
+  );
+
+  if (ailmentIndex > 1) {
+    return [
+      row[0],
+      row.slice(1, ailmentIndex).join(", ").trim(),
+      row[ailmentIndex],
+    ];
+  }
+
+  return [
+    row[0],
+    row.slice(1, -1).join(", ").trim(),
+    row[row.length - 1],
+  ];
+}
+
+function normalizeIcdPasteText(text) {
+  const rows = parseCSV(String(text || ""));
+  if (rows.length === 0) return "";
+
+  const headerMatch = findHeaderRow(rows, ICD_FIELD_DEFS, HEADER_SCAN_LIMIT);
+
+  if (headerMatch.found) {
+    const repairedRows = rows.map((row, index) =>
+      index <= headerMatch.headerRowIndex ? row : repairLooseIcdRow(row),
+    );
+
+    return (
+      normalizeRowsFromDetectedHeaders({
+        text: serializeRows(repairedRows),
+        fieldDefs: ICD_FIELD_DEFS,
+        outputColumns: [
+          { key: "icdPrefix", fallback: "" },
+          { key: "category", fallback: "" },
+          { key: "ailment", fallback: "" },
+        ],
+      }) || serializeRows(repairedRows)
+    );
+  }
+
+  const nonEmptyRows = rows.filter(
+    (row) =>
+      Array.isArray(row) &&
+      row.some((cell) => String(cell ?? "").trim() !== ""),
+  );
+
+  if (nonEmptyRows.length > 0 && nonEmptyRows.every((row) => looksLikeIcdCode(row[0]))) {
+    return serializeRows([
+      ["ICD Prefix", "Category", "Ailment"],
+      ...nonEmptyRows.map((row) => {
+        const repairedRow = repairLooseIcdRow(row);
+        return [repairedRow[0] ?? "", repairedRow[1] ?? "", repairedRow[2] ?? ""];
+      }),
+    ]);
+  }
+
+  return String(text || "");
+}
+
+function normalizeMaternityPasteText(text) {
+  return (
+    normalizeRowsFromDetectedHeaders({
+      text,
+      fieldDefs: MATERNITY_FIELD_DEFS,
+      outputColumns: [
+        { key: "employeeCode", fallback: "" },
+        { key: "procedureType", fallback: "" },
+        { key: "procedureLimit", fallback: "" },
+        { key: "claimedAmount", fallback: "" },
+        { key: "incurredAmount", fallback: "" },
+        { key: "settlementStatus", fallback: "Settled" },
+        { key: "ailment", fallback: "" },
+      ],
+    }) || String(text || "")
+  );
+}
+
+function normalizeCappedAilmentPasteText(text) {
+  return (
+    normalizeRowsFromDetectedHeaders({
+      text,
+      fieldDefs: CAPPED_AILMENT_FIELD_DEFS,
+      outputColumns: [
+        { key: "employeeCode", fallback: "" },
+        { key: "procedureType", fallback: "" },
+        { key: "procedureLimit", fallback: "" },
+        { key: "claimedAmount", fallback: "" },
+        { key: "incurredAmount", fallback: "" },
+        { key: "settlementStatus", fallback: "Settled" },
+        { key: "ailment", fallback: "" },
+      ],
+    }) || String(text || "")
+  );
 }
 
 function getHeaderInsertIndex(headerRow, targetField, fieldDefs) {
@@ -619,17 +557,40 @@ function getHeaderInsertIndex(headerRow, targetField, fieldDefs) {
   return headerRow.length;
 }
 
-function useMappedWorkspace({ sample, fieldDefs }) {
-  const [text, setText] = useState(sample);
+function useMappedWorkspace({
+  sample,
+  fieldDefs,
+  normalizeInput = (value) => String(value ?? ""),
+  initialText,
+}) {
+  const normalizedSample = normalizeInput(sample);
+  const normalizedInitialText =
+    initialText === undefined ? normalizedSample : normalizeInput(initialText);
+  const [text, setTextState] = useState(normalizedInitialText);
   const [showPreview, setShowPreview] = useState(false);
   const [mapping, setMapping] = useState({});
+  const [importError, setImportError] = useState(null);
   const [singleColText, setSingleColText] = useState("");
   const [singleColTargetKey, setSingleColTargetKey] = useState(fieldDefs[0].key);
   const [singleColStartRow, setSingleColStartRow] = useState(2);
+  const sampleRows = useMemo(() => parseCSV(normalizedSample || ""), [normalizedSample]);
+  const requiredExample = useMemo(
+    () => buildRequiredExample(fieldDefs, sampleRows),
+    [fieldDefs, sampleRows],
+  );
+
+  function setText(nextText) {
+    setImportError(null);
+    setTextState(normalizeInput(nextText));
+  }
 
   const rows = useMemo(() => parseCSV(text || ""), [text]);
   const headers = rows[0] || null;
-  const previewRows = rows.slice(1, 21);
+  const previewRows = rows.slice(1);
+  const previewRowIssues = useMemo(
+    () => getPreviewRowValidation(rows, headers, fieldDefs, mapping),
+    [rows, headers, fieldDefs, mapping],
+  );
 
   useEffect(() => {
     if (!headers) {
@@ -646,23 +607,62 @@ function useMappedWorkspace({ sample, fieldDefs }) {
   const selectedFields = Object.values(mapping || {}).filter(Boolean);
   const hasDuplicateMapping = new Set(selectedFields).size !== selectedFields.length;
 
-  async function pasteClipboard() {
+  function rejectImport(preparedImport, nextMissingRequiredFields) {
+    setImportError({
+      missingRequiredLabels: nextMissingRequiredFields.map((field) => field.label),
+      receivedHeaders: (preparedImport.headers || []).filter(
+        (header) => String(header || "").trim() !== "",
+      ),
+      scannedRows: preparedImport.scannedRows || HEADER_SCAN_LIMIT,
+      headerRowIndex: preparedImport.headerRowIndex,
+      headerFound: preparedImport.found,
+    });
+  }
+
+  function applyImportedText(nextText) {
+    const normalizedText = normalizeInput(nextText);
+    const importedRows = parseCSV(normalizedText || "");
+    const preparedImport = prepareRowsForFieldMapping(
+      importedRows,
+      fieldDefs,
+      HEADER_SCAN_LIMIT,
+    );
+    const nextRows = preparedImport.rows;
+    const nextMissingRequiredFields = preparedImport.missingRequiredFields;
+
+    if (nextRows.length === 0 || nextMissingRequiredFields.length > 0) {
+      rejectImport(preparedImport, nextMissingRequiredFields);
+      return false;
+    }
+
+    setImportError(null);
+    setTextState(serializeRows(nextRows));
+    setShowPreview(true);
+    return true;
+  }
+
+  async function importFile(file) {
+    if (!file) return;
+
     try {
-      const clipboardText = await navigator.clipboard.readText();
-      setText(clipboardText);
+      const nextText = isXlsxFile(file)
+        ? workbookSheetsToCSV(await readExcelFile(file))
+        : String(await file.text());
+
+      applyImportedText(nextText);
     } catch (error) {
-      alert("Clipboard paste failed: " + (error && error.message));
+      console.error(error);
+      alert("Could not read this file. Upload CSV or Excel (.xlsx).");
     }
   }
 
-  function importFile(file) {
-    if (!file) return;
+  function handleTextPaste(event) {
+    const clipboardText = event.clipboardData?.getData("text");
+    if (!clipboardText) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      setText(String(event.target?.result || ""));
-    };
-    reader.readAsText(file);
+    event.preventDefault();
+    event.currentTarget.value = "";
+    applyImportedText(clipboardText);
   }
 
   function editCell(previewRowIndex, colIndex, value) {
@@ -679,16 +679,25 @@ function useMappedWorkspace({ sample, fieldDefs }) {
     setText(serializeRows(nextRows));
   }
 
+  function deleteRow(previewRowIndex) {
+    const allRows = parseCSV(text || "");
+    const rowIndex = previewRowIndex + 1;
+
+    if (rowIndex < 1 || rowIndex >= allRows.length) return;
+
+    const nextRows = allRows.filter((_, index) => index !== rowIndex);
+    setText(serializeRows(nextRows));
+  }
+
   function clearData() {
+    setImportError(null);
     setText("");
+    setShowPreview(false);
   }
 
   function loadSample() {
+    setImportError(null);
     setText(sample);
-  }
-
-  function previewOnly() {
-    setSingleColText("");
     setShowPreview(true);
   }
 
@@ -763,6 +772,7 @@ function useMappedWorkspace({ sample, fieldDefs }) {
     setShowPreview,
     mapping,
     setMapping,
+    importError,
     singleColText,
     setSingleColText,
     singleColTargetKey,
@@ -772,14 +782,16 @@ function useMappedWorkspace({ sample, fieldDefs }) {
     rows,
     headers,
     previewRows,
+    previewRowIssues,
+    requiredExample,
     missingRequiredFields,
     hasDuplicateMapping,
-    pasteClipboard,
     importFile,
+    handleTextPaste,
     editCell,
+    deleteRow,
     clearData,
     loadSample,
-    previewOnly,
     applySingleColumn,
   };
 }
@@ -797,43 +809,259 @@ function PageTabs({ activeTab, setActiveTab }) {
           onClick={() => setActiveTab(tab.id)}
         >
           <span className="tab-label">{tab.label}</span>
-          <span className="tab-caption">{tab.description}</span>
         </button>
       ))}
     </div>
   );
 }
 
-function WorkspaceActionsCard({
-  workspace,
-  extraActions = [],
-  accept = ".csv,text/csv",
+function getWorkspaceDataRowCount(workspace) {
+  return Math.max(0, (workspace?.rows?.length || 0) - 1);
+}
+
+function getIcdConfigurationState(workspace) {
+  const customRowCount = getWorkspaceDataRowCount(workspace);
+  const hasHeaders = Boolean(workspace.headers);
+  const hasMappingIssues =
+    workspace.missingRequiredFields.length > 0 || workspace.hasDuplicateMapping;
+
+  if (!hasHeaders || customRowCount === 0) {
+    return {
+      mode: "built-in",
+      sourceLabel: "Built-in ICD master only",
+      title: "Using built-in ICD master",
+      summary:
+        "No custom ICD rows are active. Calculators use the built-in ICD master only.",
+      detail: `The built-in lookup covers ${formatCount(
+        BUILT_IN_ICD_MAPPING_COUNT,
+      )} ICD prefixes before any custom overrides are applied.`,
+      customRowCount: 0,
+    };
+  }
+
+  if (hasMappingIssues) {
+    return {
+      mode: "needs-attention",
+      sourceLabel: "Built-in ICD master with inactive custom draft",
+      title: "ICD configuration needs attention",
+      summary:
+        "The current ICD upload is not active yet. Calculators continue using the built-in ICD master only.",
+      detail:
+        "Fix the missing required mappings or duplicate column selections on the Configuration page to activate the custom ICD rows.",
+      customRowCount: 0,
+    };
+  }
+
+  return {
+    mode: "custom",
+    sourceLabel: "Built-in ICD master plus Configuration overrides",
+    title: "Using Configuration overrides",
+    summary: `${formatCount(customRowCount)} custom ICD row${
+      customRowCount === 1 ? "" : "s"
+    } are active and will override matching built-in rows.`,
+    detail:
+      "Custom ICD rows from the Configuration page are layered on top of the built-in ICD master for all calculators that use ICD mappings.",
+    customRowCount,
+  };
+}
+
+function getBeneficiaryConfigurationState(workspace) {
+  const activeRowCount = getWorkspaceDataRowCount(workspace);
+  const hasHeaders = Boolean(workspace.headers);
+  const hasMappingIssues =
+    workspace.missingRequiredFields.length > 0 || workspace.hasDuplicateMapping;
+
+  if (!hasHeaders || activeRowCount === 0) {
+    return {
+      mode: "missing",
+      sourceLabel: "Configuration beneficiary mapping",
+      title: "Beneficiary mapping required",
+      summary:
+        "No beneficiary mapping is active yet. The co-pay calculator needs this mapping to group relationships correctly.",
+      detail:
+        "Load a beneficiary mapping file on the Configuration page to enable co-pay calculation.",
+      activeRowCount: 0,
+    };
+  }
+
+  if (hasMappingIssues) {
+    return {
+      mode: "needs-attention",
+      sourceLabel: "Configuration beneficiary mapping",
+      title: "Beneficiary mapping needs attention",
+      summary:
+        "The current beneficiary upload is not active yet. Fix the mapping issues on the Configuration page to use it.",
+      detail:
+        "Fix the missing required mappings or duplicate column selections on the Configuration page to activate the beneficiary mapping rows.",
+      activeRowCount: 0,
+    };
+  }
+
+  return {
+    mode: "ready",
+    sourceLabel: "Configuration beneficiary mapping",
+    title: "Beneficiary mapping ready",
+    summary: `${formatCount(activeRowCount)} beneficiary mapping row${
+      activeRowCount === 1 ? "" : "s"
+    } are active for co-pay relationship grouping.`,
+    detail:
+      "The active beneficiary mapping from the Configuration page is used by calculators that rely on relationship grouping.",
+    activeRowCount,
+  };
+}
+
+function BeneficiaryConfigurationStatusCard({
+  title = "Beneficiary Mapping Source",
+  description,
+  status,
+  actionLabel,
+  onAction,
+  compact = false,
 }) {
+  if (compact) {
+    return (
+      <section className="card compact-status-card">
+        <div className="compact-status-row">
+          <div>
+            <div className="section-label">{title}</div>
+            <p className="muted compact-status-copy">
+              {status.mode === "ready"
+                ? `${formatCount(status.activeRowCount)} rows active from Configuration.`
+                : description || status.summary}
+            </p>
+          </div>
+          {actionLabel && onAction ? (
+            <button type="button" className="secondary" onClick={onAction}>
+              {actionLabel}
+            </button>
+          ) : null}
+        </div>
+
+        {status.mode !== "ready" ? <div className="notice">{status.detail}</div> : null}
+      </section>
+    );
+  }
+
+  return (
+    <section className="card">
+      <div className="section-head">
+        <div>
+          <h2>{title}</h2>
+          <p className="muted">{description || status.detail}</p>
+        </div>
+        {actionLabel && onAction ? (
+          <button type="button" className="secondary" onClick={onAction}>
+            {actionLabel}
+          </button>
+        ) : null}
+      </div>
+
+      <div className="config-grid">
+        <div className="info-card">
+          <div className="section-label">Current Source</div>
+          <p className="muted">{status.sourceLabel}</p>
+        </div>
+        <div className="info-card">
+          <div className="section-label">Active Mapping Rows</div>
+          <p className="muted">{formatCount(status.activeRowCount)}</p>
+        </div>
+        <div className="info-card">
+          <div className="section-label">Used By</div>
+          <p className="muted">Co-pay relationship grouping</p>
+        </div>
+        <div className="info-card">
+          <div className="section-label">Effective Behavior</div>
+          <p className="muted">{status.summary}</p>
+        </div>
+      </div>
+
+      {status.mode !== "ready" ? <div className="notice">{status.detail}</div> : null}
+    </section>
+  );
+}
+
+function IcdConfigurationStatusCard({
+  title = "ICD Configuration",
+  description,
+  status,
+  actionLabel,
+  onAction,
+  compact = false,
+}) {
+  if (compact) {
+    return (
+      <section className="card compact-status-card">
+        <div className="compact-status-row">
+          <div>
+            <div className="section-label">{title}</div>
+            <p className="muted compact-status-copy">
+              {status.mode === "custom"
+                ? `${formatCount(status.customRowCount)} custom row${
+                    status.customRowCount === 1 ? "" : "s"
+                  } active from Configuration.`
+                : status.mode === "built-in"
+                  ? "Using built-in ICD master."
+                  : description || status.summary}
+            </p>
+          </div>
+          {actionLabel && onAction ? (
+            <button type="button" className="secondary" onClick={onAction}>
+              {actionLabel}
+            </button>
+          ) : null}
+        </div>
+
+        {status.mode === "needs-attention" ? <div className="notice">{status.detail}</div> : null}
+      </section>
+    );
+  }
+
+  return (
+    <section className="card">
+      <div className="section-head">
+        <div>
+          <h2>{title}</h2>
+          <p className="muted">{description || status.detail}</p>
+        </div>
+        {actionLabel && onAction ? (
+          <button type="button" className="secondary" onClick={onAction}>
+            {actionLabel}
+          </button>
+        ) : null}
+      </div>
+
+      <div className="config-grid">
+        <div className="info-card">
+          <div className="section-label">Current Source</div>
+          <p className="muted">{status.sourceLabel}</p>
+        </div>
+        <div className="info-card">
+          <div className="section-label">Built-in ICD Prefixes</div>
+          <p className="muted">{formatCount(BUILT_IN_ICD_MAPPING_COUNT)}</p>
+        </div>
+        <div className="info-card">
+          <div className="section-label">Active Custom Rows</div>
+          <p className="muted">{formatCount(status.customRowCount)}</p>
+        </div>
+        <div className="info-card">
+          <div className="section-label">Effective Behavior</div>
+          <p className="muted">{status.summary}</p>
+        </div>
+      </div>
+
+      {status.mode === "needs-attention" ? <div className="notice">{status.detail}</div> : null}
+    </section>
+  );
+}
+
+function WorkspaceActionsCard({
+  extraActions = [],
+}) {
+  if (extraActions.length === 0) return null;
+
   return (
     <section className="card">
       <div className="toolbar">
-        <input
-          className="file-input"
-          type="file"
-          accept={accept}
-          onChange={(event) => workspace.importFile(event.target.files?.[0])}
-        />
-        <button type="button" onClick={workspace.pasteClipboard}>
-          Paste from Clipboard
-        </button>
-        <button type="button" className="secondary" onClick={workspace.loadSample}>
-          Load Sample
-        </button>
-        <button type="button" className="secondary" onClick={workspace.clearData}>
-          Clear
-        </button>
-        <button
-          type="button"
-          className="secondary"
-          onClick={() => workspace.setShowPreview((value) => !value)}
-        >
-          {workspace.showPreview ? "Hide Preview" : "Show Preview"}
-        </button>
         {extraActions.map((action) => (
           <button
             key={action.label}
@@ -858,46 +1086,92 @@ function FieldMappingCard({
   onMappingChange,
   showDuplicateNotice,
 }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const hasHeaders = Boolean(headers);
+  const mappedCount = fieldDefs.filter((field) => Boolean(mapping[field.key])).length;
+  const missingRequiredCount = headers
+    ? fieldDefs.filter((field) => field.required && !mapping[field.key]).length
+    : 0;
+  const summaryParts = headers
+    ? [`${mappedCount} of ${fieldDefs.length} fields mapped`]
+    : [];
+
+  if (headers) {
+    if (missingRequiredCount > 0) {
+      summaryParts.push(`${missingRequiredCount} required still missing`);
+    } else {
+      summaryParts.push("all required fields ready");
+    }
+
+    if (showDuplicateNotice) {
+      summaryParts.push("duplicate source columns selected");
+    }
+  }
+
+  const mappingSummary = headers
+    ? `${summaryParts.join(", ")}.`
+    : "Paste or upload data to map fields.";
+
   return (
-    <section className="card">
-      <h2>{title}</h2>
-      <p className="muted">{description}</p>
-      {headers ? (
-        <>
-          <div className="mapping-grid">
-            {fieldDefs.map((field) => (
-              <div key={field.key}>
-                <label>
-                  {field.label}
-                  <span className={`field-chip ${field.required ? "required" : "optional"}`}>
-                    {field.required ? "Required" : "Optional"}
-                  </span>
-                </label>
-                <select
-                  value={mapping[field.key] || ""}
-                  onChange={(event) =>
-                    onMappingChange((current) => ({
-                      ...current,
-                      [field.key]: event.target.value,
-                    }))
-                  }
-                >
-                  <option value="">-- select column --</option>
-                  {headers.map((header) => (
-                    <option key={header} value={header}>
-                      {header}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ))}
+    <section
+      className={`card field-mapping-card ${hasHeaders && !isExpanded ? "is-collapsed" : ""}`.trim()}
+    >
+      <div className="section-head">
+        <div>
+          <h2>{title}</h2>
+          {isExpanded || !hasHeaders ? <p className="muted">{description}</p> : null}
+        </div>
+        {hasHeaders ? (
+          <div className="mapping-actions">
+            {isExpanded ? <div className="mapping-summary">{mappingSummary}</div> : null}
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setIsExpanded((value) => !value)}
+            >
+              {isExpanded ? "Hide Mapping" : "Show Mapping"}
+            </button>
           </div>
-          {showDuplicateNotice ? (
-            <div className="notice">
-              Each mapped field must use a different source column.
+        ) : null}
+      </div>
+      {hasHeaders ? (
+        isExpanded ? (
+          <>
+            <div className="mapping-grid">
+              {fieldDefs.map((field) => (
+                <div key={field.key}>
+                  <label>
+                    {field.label}
+                    <span className={`field-chip ${field.required ? "required" : "optional"}`}>
+                      {field.required ? "Required" : "Optional"}
+                    </span>
+                  </label>
+                  <select
+                    value={mapping[field.key] || ""}
+                    onChange={(event) =>
+                      onMappingChange((current) => ({
+                        ...current,
+                        [field.key]: event.target.value,
+                      }))
+                    }
+                  >
+                    <option value="">-- select column --</option>
+                    {headers.map((header) => (
+                      <option key={header} value={header}>
+                        {header}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
             </div>
-          ) : null}
-        </>
+            {showDuplicateNotice ? (
+              <div className="notice">
+                Each mapped field must use a different source column.
+              </div>
+            ) : null}
+          </>
+        ) : null
       ) : (
         <div className="notice">Paste or upload data to map fields.</div>
       )}
@@ -905,40 +1179,61 @@ function FieldMappingCard({
   );
 }
 
-function PreviewTable({ headers, rows, onEditCell }) {
+function PreviewTable({ headers, rows, rowIssues, onEditCell, onDeleteRow }) {
   if (!headers) return null;
 
   return (
-    <div className="table-wrap top-gap">
+    <div className="table-wrap preview-table-wrap top-gap">
       <table>
         <thead>
           <tr>
+            <th className="row-index-head">Row</th>
             {headers.map((header) => (
               <th key={header}>{header}</th>
             ))}
+            <th className="row-action-head">Action</th>
           </tr>
         </thead>
         <tbody>
           {rows.length === 0 ? (
             <tr>
-              <td colSpan={headers.length}>No data rows to preview.</td>
+              <td colSpan={headers.length + 2}>No data rows to preview.</td>
             </tr>
           ) : (
-            rows.map((row, rowIndex) => (
-              <tr key={`${rowIndex}-${row.join("|")}`}>
-                {headers.map((header, colIndex) => (
-                  <td key={`${header}-${colIndex}`}>
-                    <input
-                      className="preview-input"
-                      value={row[colIndex] || ""}
-                      onChange={(event) =>
-                        onEditCell(rowIndex, colIndex, event.target.value)
-                      }
-                    />
+            rows.map((row, rowIndex) => {
+              const issues = rowIssues?.[rowIndex] || [];
+
+              return (
+                <tr
+                  key={`${rowIndex}-${row.join("|")}`}
+                  className={issues.length > 0 ? "preview-row-invalid" : ""}
+                  title={issues.length > 0 ? issues.join(". ") : undefined}
+                >
+                  <td className="row-index-cell">{rowIndex + 1}</td>
+                  {headers.map((header, colIndex) => (
+                    <td key={`${header}-${colIndex}`} className="preview-cell">
+                      <input
+                        className={`preview-input ${issues.length > 0 ? "is-invalid" : ""}`}
+                        value={row[colIndex] || ""}
+                        spellCheck={false}
+                        onChange={(event) =>
+                          onEditCell(rowIndex, colIndex, event.target.value)
+                        }
+                      />
+                    </td>
+                  ))}
+                  <td className="row-action-cell">
+                    <button
+                      type="button"
+                      className="secondary row-delete-button"
+                      onClick={() => onDeleteRow(rowIndex)}
+                    >
+                      Delete
+                    </button>
                   </td>
-                ))}
-              </tr>
-            ))
+                </tr>
+              );
+            })
           )}
         </tbody>
       </table>
@@ -952,102 +1247,270 @@ function DataEntryCard({
   workspace,
   fieldDefs,
   missingLabels,
+  accept = ".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }) {
+  const [isExpanded, setIsExpanded] = useState(true);
+  const hasText = Boolean(workspace.text.trim());
+  const dataRowCount = Math.max(0, workspace.rows.length - 1);
+  const columnCount = workspace.headers?.length || 0;
+  const previewRowCount = workspace.previewRows.length;
+  const invalidPreviewRowCount = workspace.previewRowIssues.filter(
+    (issues) => issues.length > 0,
+  ).length;
+  const collapsedSummary = workspace.importError
+    ? "Import needs attention."
+    : hasText
+      ? `${formatCount(dataRowCount)} rows x ${formatCount(columnCount)} columns loaded.`
+      : "No data loaded yet.";
+
   return (
-    <section className="card">
-      <h2>{title}</h2>
-      <p className="muted">{description}</p>
-      <textarea
-        value={workspace.text}
-        onChange={(event) => workspace.setText(event.target.value)}
-        rows={8}
-        spellCheck={false}
-      />
-      <div className="split-grid top-gap">
-        <div className="stack">
-          <div className="stack">
-            <div className="section-label">Paste single column from Excel</div>
-            <div className="muted">
-              Paste a newline-separated column and choose which standard field it
-              should populate.
-            </div>
-          </div>
-          <textarea
-            value={workspace.singleColText}
-            onChange={(event) => workspace.setSingleColText(event.target.value)}
-            rows={6}
-            placeholder="Paste a single column here"
-          />
-          <div className="inline-controls">
-            <select
-              value={workspace.singleColTargetKey}
-              onChange={(event) => workspace.setSingleColTargetKey(event.target.value)}
-              className="grow"
-            >
-              {fieldDefs.map((field) => {
-                const option = getFieldOption(field);
-                return (
-                  <option key={option.key} value={option.key}>
-                    {option.label}
-                  </option>
-                );
-              })}
-            </select>
+    <section
+      className={`card data-entry-card${!isExpanded ? " is-collapsed" : ""}`}
+    >
+      <div className="section-head">
+        <div>
+          <h2>{title}</h2>
+          {isExpanded ? <p className="muted">{description}</p> : null}
+        </div>
+        <div className="mapping-actions">
+          {!isExpanded ? (
+            <div className="mapping-summary">{collapsedSummary}</div>
+          ) : null}
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => setIsExpanded((current) => !current)}
+          >
+            {isExpanded ? "Hide" : "Show"}
+          </button>
+        </div>
+      </div>
+
+      {isExpanded ? (
+        <>
+          <div className="toolbar data-entry-toolbar">
             <input
-              type="number"
-              min={2}
-              value={workspace.singleColStartRow}
-              onChange={(event) =>
-                workspace.setSingleColStartRow(Number(event.target.value || 2))
-              }
-              className="start-row-input"
-              title="Start at data row (1 = header, 2 = first data row)"
+              className="file-input"
+              type="file"
+              accept={accept}
+              onChange={(event) => {
+                workspace.importFile(event.target.files?.[0]);
+                event.target.value = "";
+              }}
             />
             <button
               type="button"
               className="secondary"
-              onClick={() => workspace.setSingleColText("")}
+              onClick={workspace.loadSample}
             >
-              Clear
-            </button>
-          </div>
-        </div>
-
-        <div className="stack">
-          <div className="stack">
-            <div className="section-label">Apply column</div>
-            <div className="muted">
-              Merge the pasted column into the current dataset before
-              calculation.
-            </div>
-          </div>
-          <div className="stack grow">
-            <button type="button" onClick={workspace.applySingleColumn}>
-              Apply Column Paste
+              Load Sample
             </button>
             <button
               type="button"
               className="secondary"
-              onClick={workspace.previewOnly}
+              onClick={workspace.clearData}
             >
-              Preview Only
+              Clear
             </button>
           </div>
-        </div>
-      </div>
 
-      {missingLabels.length > 0 ? (
-        <div className="notice">
-          Missing required mappings: {missingLabels.join(", ")}
-        </div>
-      ) : null}
+          <div className="paste-board">
+            <textarea
+              className="paste-capture"
+              aria-label="Paste data from Excel or CSV"
+              onPaste={workspace.handleTextPaste}
+              onChange={(event) => {
+                event.target.value = "";
+              }}
+              onInput={(event) => {
+                event.currentTarget.value = "";
+              }}
+              spellCheck={false}
+            />
+            <div className="section-label">
+              {hasText
+                ? "Paste again to replace current data"
+                : "Paste from Excel or CSV"}
+            </div>
+            <p className="muted data-text-hint">
+              Copy cells in Excel, click here, and press Ctrl+V. Keep the header
+              row on the first line.
+            </p>
+            <div className="paste-steps" aria-label="How to paste from Excel">
+              <span className="paste-step">1. Copy cells in Excel</span>
+              <span className="paste-step">2. Click inside this area</span>
+              <span className="paste-step">3. Press Ctrl+V</span>
+            </div>
+            {hasText ? (
+              <div className="paste-board-meta">
+                Current data: {formatCount(dataRowCount)} rows x{" "}
+                {formatCount(columnCount)} columns
+              </div>
+            ) : null}
+          </div>
 
-      {workspace.showPreview ? (
-        <PreviewTable
-          headers={workspace.headers}
-          rows={workspace.previewRows}
-          onEditCell={workspace.editCell}
-        />
+          {workspace.importError ? (
+            <div className="notice import-guide">
+              <div className="section-label">
+                This file format cannot be imported yet
+              </div>
+              <p>
+                The app scans the first {workspace.importError.scannedRows} row
+                {workspace.importError.scannedRows === 1 ? "" : "s"} for a usable
+                header row. Missing required headers:{" "}
+                {workspace.importError.missingRequiredLabels.join(", ")}.
+              </p>
+              {workspace.importError.headerFound &&
+              workspace.importError.receivedHeaders.length > 0 ? (
+                <p>
+                  Best header row found at row{" "}
+                  {workspace.importError.headerRowIndex + 1}. Headers used for
+                  mapping: {workspace.importError.receivedHeaders.join(", ")}.
+                </p>
+              ) : workspace.importError.receivedHeaders.length > 0 ? (
+                <p>
+                  We could not find a usable header row. First row values seen:{" "}
+                  {workspace.importError.receivedHeaders.join(", ")}.
+                </p>
+              ) : (
+                <p>No usable header row was detected in the first scanned rows.</p>
+              )}
+              <p>Use a file shaped like this example:</p>
+              <div className="table-wrap import-guide-table">
+                <table>
+                  <thead>
+                    <tr>
+                      {workspace.requiredExample.map((column) => (
+                        <th key={column.key}>{column.header}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      {workspace.requiredExample.map((column) => (
+                        <td key={column.key}>{column.value}</td>
+                      ))}
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : null}
+
+          {missingLabels.length > 0 ? (
+            <div className="notice">
+              Missing required mappings: {missingLabels.join(", ")}
+            </div>
+          ) : null}
+
+          {hasText ? (
+            <div className="preview-panel">
+              <div className="preview-head">
+                <div>
+                  <div className="section-label">Editable table preview</div>
+                  <p className="muted">
+                    Showing {formatCount(previewRowCount)} data row
+                    {previewRowCount === 1 ? "" : "s"} with an 8-row viewport.
+                    Scroll for more, edit cells directly, or delete a row.
+                  </p>
+                  {invalidPreviewRowCount > 0 ? (
+                    <p className="preview-warning">
+                      {formatCount(invalidPreviewRowCount)} row
+                      {invalidPreviewRowCount === 1 ? "" : "s"} need attention.
+                      Incomplete or unexpected rows are highlighted in red.
+                    </p>
+                  ) : null}
+                </div>
+                {columnCount > 0 ? (
+                  <div className="preview-badge">
+                    {formatCount(dataRowCount)} rows x {formatCount(columnCount)}{" "}
+                    columns
+                  </div>
+                ) : null}
+              </div>
+              <PreviewTable
+                headers={workspace.headers}
+                rows={workspace.previewRows}
+                rowIssues={workspace.previewRowIssues}
+                onEditCell={workspace.editCell}
+                onDeleteRow={workspace.deleteRow}
+              />
+            </div>
+          ) : null}
+
+          <details className="advanced-tools">
+            <summary>Advanced: raw text editor</summary>
+            <div className="advanced-tools-body stack">
+              <p className="muted">
+                Use this only if you need to inspect or edit the pasted data as
+                raw text.
+              </p>
+              <textarea
+                className="data-textarea raw-editor"
+                value={workspace.text}
+                onChange={(event) => workspace.setText(event.target.value)}
+                rows={8}
+                spellCheck={false}
+                wrap="off"
+                placeholder="Paste Excel rows here"
+              />
+            </div>
+          </details>
+
+          <details className="advanced-tools">
+            <summary>Advanced: paste a single column</summary>
+            <div className="advanced-tools-body stack">
+              <p className="muted">
+                Use this only if you need to paste one newline-separated Excel
+                column into an existing dataset.
+              </p>
+              <textarea
+                value={workspace.singleColText}
+                onChange={(event) => workspace.setSingleColText(event.target.value)}
+                rows={5}
+                placeholder="Paste a single column here"
+              />
+              <div className="inline-controls">
+                <select
+                  value={workspace.singleColTargetKey}
+                  onChange={(event) =>
+                    workspace.setSingleColTargetKey(event.target.value)
+                  }
+                  className="grow"
+                >
+                  {fieldDefs.map((field) => {
+                    const option = getFieldOption(field);
+                    return (
+                      <option key={option.key} value={option.key}>
+                        {option.label}
+                      </option>
+                    );
+                  })}
+                </select>
+                <input
+                  type="number"
+                  min={2}
+                  value={workspace.singleColStartRow}
+                  onChange={(event) =>
+                    workspace.setSingleColStartRow(Number(event.target.value || 2))
+                  }
+                  className="start-row-input"
+                  title="Start at data row (1 = header, 2 = first data row)"
+                />
+                <button type="button" onClick={workspace.applySingleColumn}>
+                  Apply Column Paste
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => workspace.setSingleColText("")}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+          </details>
+        </>
       ) : null}
     </section>
   );
@@ -1103,6 +1566,8 @@ function CopayDashboardConfigCard({
   setDashboardForm,
   numberFormat,
   dashboard,
+  actionLabel,
+  onAction,
 }) {
   function updateLimit(relationshipType, field, value) {
     setDashboardForm((current) => ({
@@ -1118,12 +1583,18 @@ function CopayDashboardConfigCard({
     <section className="card">
       <div className="section-head">
         <div>
-          <h2>Dashboard Configuration</h2>
+          <h2>Co-pay Settings</h2>
           <p className="muted">
-            Dashboard existing limits stay separate from the workbook formulas
-            used for row-level <code>Copay Existing</code>.
+            Existing and proposed limits are editable here. Row-level
+            <code> Copay Existing </code>
+            still follows the workbook formula.
           </p>
         </div>
+        {onAction ? (
+          <button type="button" className="secondary" onClick={onAction}>
+            {actionLabel}
+          </button>
+        ) : null}
       </div>
       <div className="config-grid">
         <div className="config-card">
@@ -1216,6 +1687,8 @@ function MaternityDashboardConfigCard({
   setDashboardForm,
   numberFormat,
   dashboard,
+  actionLabel,
+  onAction,
 }) {
   function updateLimit(procedureType, field, value) {
     setDashboardForm((current) => ({
@@ -1231,13 +1704,18 @@ function MaternityDashboardConfigCard({
     <section className="card">
       <div className="section-head">
         <div>
-          <h2>Maternity Dashboard Configuration</h2>
+          <h2>Maternity Settings</h2>
           <p className="muted">
-            Existing and proposed maternity limits are editable. Row-level
+            Existing and proposed limits are editable here. Row-level
             <code> Difference </code>
-            still uses the grouped procedure limit from the uploaded data.
+            still uses the grouped procedure limit from uploaded data.
           </p>
         </div>
+        {onAction ? (
+          <button type="button" className="secondary" onClick={onAction}>
+            {actionLabel}
+          </button>
+        ) : null}
       </div>
       <div className="config-grid">
         <div className="config-card">
@@ -1330,6 +1808,8 @@ function RoomRentDashboardConfigCard({
   setDashboardForm,
   numberFormat,
   dashboard,
+  actionLabel,
+  onAction,
 }) {
   function updateLimit(roomCategory, field, value) {
     setDashboardForm((current) => ({
@@ -1345,12 +1825,17 @@ function RoomRentDashboardConfigCard({
     <section className="card">
       <div className="section-head">
         <div>
-          <h2>Room Rent Configuration</h2>
+          <h2>Room Rent Settings</h2>
           <p className="muted">
-            Existing and proposed room-rent caps are stored as percentages of
-            sum insured and applied to Normal and ICU categories separately.
+            Existing and proposed caps are stored as percentages of sum insured
+            and applied separately to Normal and ICU rows.
           </p>
         </div>
+        {onAction ? (
+          <button type="button" className="secondary" onClick={onAction}>
+            {actionLabel}
+          </button>
+        ) : null}
       </div>
       <div className="config-grid">
         <div className="config-card">
@@ -1443,6 +1928,8 @@ function CappedAilmentDashboardConfigCard({
   setDashboardForm,
   numberFormat,
   dashboard,
+  actionLabel,
+  onAction,
 }) {
   function updateLimit(procedureType, field, value) {
     setDashboardForm((current) => ({
@@ -1458,13 +1945,17 @@ function CappedAilmentDashboardConfigCard({
     <section className="card">
       <div className="section-head">
         <div>
-          <h2>Capped Ailment Configuration</h2>
+          <h2>Capped Ailment Settings</h2>
           <p className="muted">
-            Configure existing and proposed limits by procedure type. Rows with
-            zero-configured limits stay visible and contribute zero impact,
-            except Psychiatric which follows the separate incurred-amount rule.
+            Configure existing and proposed limits by procedure type. Psychiatric
+            still follows the separate incurred-amount rule.
           </p>
         </div>
+        {onAction ? (
+          <button type="button" className="secondary" onClick={onAction}>
+            {actionLabel}
+          </button>
+        ) : null}
       </div>
 
       <div className="table-wrap">
@@ -1533,13 +2024,14 @@ function CappedAilmentDashboardConfigCard({
 }
 
 function SumInsuredCalculator() {
-  const workspace = useMappedWorkspace({
-    sample: SUM_INSURED_SAMPLE,
-    fieldDefs: SUM_INSURED_FIELD_DEFS,
-  });
   const [statusFilter, setStatusFilter] = useState("Settled");
   const [proposedLimit, setProposedLimit] = useState(300000);
   const [numberFormat, setNumberFormat] = useState("en-IN");
+  const workspace = useMappedWorkspace({
+    sample: SUM_INSURED_SAMPLE,
+    fieldDefs: SUM_INSURED_FIELD_DEFS,
+    normalizeInput: (text) => normalizeSumInsuredPasteText(text, statusFilter),
+  });
 
   const canCalculate =
     workspace.headers &&
@@ -1596,35 +2088,38 @@ function SumInsuredCalculator() {
 
   return (
     <div className="panel">
-      <section className="hero">
-        <div className="hero-card">
-          <h2>Sum Insured Impact Calculator</h2>
-          <p>
-            Paste claim data, upload CSV, or copy from Excel to test how a new
-            sum insured changes payable claim amounts.
-          </p>
-          <div className="notice">
-            Required fields: Employee ID, Claim Status, Current Sum Insured,
-            Claimed Amount, and Incurred Amount.
-          </div>
+      <section className="hero hero-compact">
+        <div className="hero-card hero-card-compact">
+          <h2>Sum Insured Impact</h2>
+          <p>Paste claim data to compare current and proposed payable amounts.</p>
         </div>
-        <div className="metric">
+        <div className="metric metric-compact">
           <div>
             <div className="metric-label">Grand Total Impact</div>
             <div className={`metric-value ${moneyClass(grandTotal)}`}>
               {formatNumber(grandTotal, numberFormat)}
             </div>
           </div>
-          <p className="metric-copy">
-            Negative values mean payable amount reduces under the proposed
-            limit.
-          </p>
+          <p className="metric-copy">Negative means payable reduces.</p>
         </div>
       </section>
 
-      <WorkspaceActionsCard
+      <FieldMappingCard
+        headers={workspace.headers}
+        mapping={workspace.mapping}
+        fieldDefs={SUM_INSURED_FIELD_DEFS}
+        onMappingChange={workspace.setMapping}
+        showDuplicateNotice={workspace.hasDuplicateMapping}
+      />
+
+      <WorkspaceActionsCard workspace={workspace} />
+
+      <DataEntryCard
+        title="Paste / Upload Data"
+        description="Upload a claim file or paste the raw table directly."
         workspace={workspace}
-        extraActions={[{ label: "Download Results CSV", onClick: downloadResults }]}
+        fieldDefs={SUM_INSURED_FIELD_DEFS}
+        missingLabels={workspace.missingRequiredFields.map((field) => field.label)}
       />
 
       <section className="card">
@@ -1656,22 +2151,6 @@ function SumInsuredCalculator() {
           </div>
         </div>
       </section>
-
-      <FieldMappingCard
-        headers={workspace.headers}
-        mapping={workspace.mapping}
-        fieldDefs={SUM_INSURED_FIELD_DEFS}
-        onMappingChange={workspace.setMapping}
-        showDuplicateNotice={workspace.hasDuplicateMapping}
-      />
-
-      <DataEntryCard
-        title="Paste / Upload Data"
-        description="Upload a claim file or paste the raw table directly."
-        workspace={workspace}
-        fieldDefs={SUM_INSURED_FIELD_DEFS}
-        missingLabels={workspace.missingRequiredFields.map((field) => field.label)}
-      />
 
       <section className="card">
         <div className="section-head">
@@ -1733,6 +2212,9 @@ function SumInsuredCalculator() {
               affect totals.
             </p>
           </div>
+          <button type="button" className="secondary" onClick={downloadResults}>
+            Download Results CSV
+          </button>
         </div>
         <div className="table-wrap tall-table">
           <table>
@@ -1792,18 +2274,97 @@ function SumInsuredCalculator() {
   );
 }
 
-function CopayCalculator() {
+function ConfigurationPage({
+  beneficiaryWorkspace,
+  beneficiaryConfigurationState,
+  icdWorkspace,
+  icdConfigurationState,
+}) {
+  return (
+    <div className="panel">
+      <section className="hero hero-compact">
+        <div className="hero-card hero-card-compact">
+          <h2>Configuration</h2>
+          <p>
+            Manage shared mapping tables here. Calculators automatically pick up the
+            active configuration from this page.
+          </p>
+        </div>
+        <div className="metric metric-compact">
+          <div>
+            <div className="metric-label">Active ICD Override Rows</div>
+            <div className="metric-value">
+              {formatCount(icdConfigurationState.customRowCount)}
+            </div>
+          </div>
+          <p className="metric-copy">
+            {icdConfigurationState.mode === "custom"
+              ? "Custom ICD rows are active for downstream calculators."
+              : "Built-in ICD defaults stay active until custom rows are valid."}
+          </p>
+        </div>
+      </section>
+
+      <IcdConfigurationStatusCard
+        status={icdConfigurationState}
+        description="This is the shared ICD source for calculators that rely on ICD-to-ailment mappings."
+      />
+
+      <BeneficiaryConfigurationStatusCard
+        title="Beneficiary Mapping"
+        status={beneficiaryConfigurationState}
+        description="This is the shared beneficiary source for calculators that rely on relationship grouping."
+      />
+
+      <FieldMappingCard
+        title="Beneficiary Mapping"
+        description="Map beneficiary relationships to the shared dimension fields used for relationship grouping."
+        headers={beneficiaryWorkspace.headers}
+        mapping={beneficiaryWorkspace.mapping}
+        fieldDefs={BENEFICIARY_FIELD_DEFS}
+        onMappingChange={beneficiaryWorkspace.setMapping}
+        showDuplicateNotice={beneficiaryWorkspace.hasDuplicateMapping}
+      />
+
+      <DataEntryCard
+        title="Paste / Upload Beneficiary Mapping"
+        description="Upload the beneficiary lookup table or paste it directly from Excel. Calculators will read the active mapping from this page."
+        workspace={beneficiaryWorkspace}
+        fieldDefs={BENEFICIARY_FIELD_DEFS}
+        missingLabels={beneficiaryWorkspace.missingRequiredFields.map((field) => field.label)}
+      />
+
+      <FieldMappingCard
+        title="ICD / Ailment Mapping"
+        description="Map ICD prefixes or full ICD codes to the ailment lookup used by the calculators. The built-in ICD master always remains available."
+        headers={icdWorkspace.headers}
+        mapping={icdWorkspace.mapping}
+        fieldDefs={ICD_FIELD_DEFS}
+        onMappingChange={icdWorkspace.setMapping}
+        showDuplicateNotice={icdWorkspace.hasDuplicateMapping}
+      />
+
+      <DataEntryCard
+        title="Paste / Upload ICD Mapping"
+        description="Upload the ICD lookup table or paste it directly from Excel to override or extend the built-in master ICD list. Sheets with ICD Prefix or ICD Start Code plus Group Diagnosis1 are supported."
+        workspace={icdWorkspace}
+        fieldDefs={ICD_FIELD_DEFS}
+        missingLabels={icdWorkspace.missingRequiredFields.map((field) => field.label)}
+      />
+    </div>
+  );
+}
+
+function CopayCalculator({
+  beneficiaryConfigurationState,
+  sharedBeneficiaryConfigurationRows,
+  icdConfigurationState,
+  sharedIcdConfigurationRows,
+  onOpenConfiguration,
+}) {
   const claimsWorkspace = useMappedWorkspace({
     sample: COPAY_CLAIM_SAMPLE,
     fieldDefs: COPAY_CLAIM_FIELD_DEFS,
-  });
-  const beneficiaryWorkspace = useMappedWorkspace({
-    sample: BENEFICIARY_TYPE_SAMPLE,
-    fieldDefs: BENEFICIARY_FIELD_DEFS,
-  });
-  const icdWorkspace = useMappedWorkspace({
-    sample: ICD_AILMENT_SAMPLE,
-    fieldDefs: ICD_FIELD_DEFS,
   });
   const [numberFormat, setNumberFormat] = useState("en-IN");
   const [dashboardForm, setDashboardForm] = useState(
@@ -1837,14 +2398,9 @@ function CopayCalculator() {
 
   const canCalculate =
     claimsWorkspace.headers &&
-    beneficiaryWorkspace.headers &&
-    icdWorkspace.headers &&
+    beneficiaryConfigurationState.mode === "ready" &&
     claimsWorkspace.missingRequiredFields.length === 0 &&
-    beneficiaryWorkspace.missingRequiredFields.length === 0 &&
-    icdWorkspace.missingRequiredFields.length === 0 &&
-    !claimsWorkspace.hasDuplicateMapping &&
-    !beneficiaryWorkspace.hasDuplicateMapping &&
-    !icdWorkspace.hasDuplicateMapping;
+    !claimsWorkspace.hasDuplicateMapping;
 
   const copayResult = useMemo(() => {
     if (!canCalculate) {
@@ -1888,26 +2444,12 @@ function CopayCalculator() {
         claimsWorkspace.mapping,
         CLAIM_FIELD_KEYS,
       ),
-      beneficiaryTypeRows: mapRowsToObjects(
-        beneficiaryWorkspace.rows,
-        beneficiaryWorkspace.headers,
-        beneficiaryWorkspace.mapping,
-        BENEFICIARY_FIELD_KEYS,
-      ),
-      icdRows: mapRowsToObjects(
-        icdWorkspace.rows,
-        icdWorkspace.headers,
-        icdWorkspace.mapping,
-        ICD_FIELD_KEYS,
-      ),
+      beneficiaryTypeRows: sharedBeneficiaryConfigurationRows,
+      icdRows: sharedIcdConfigurationRows,
       dashboardConfig,
     });
   }, [
-    beneficiaryWorkspace.headers,
-    beneficiaryWorkspace.mapping,
-    beneficiaryWorkspace.rows,
-    beneficiaryWorkspace.hasDuplicateMapping,
-    beneficiaryWorkspace.missingRequiredFields.length,
+    beneficiaryConfigurationState.mode,
     canCalculate,
     claimsWorkspace.headers,
     claimsWorkspace.mapping,
@@ -1915,11 +2457,8 @@ function CopayCalculator() {
     claimsWorkspace.hasDuplicateMapping,
     claimsWorkspace.missingRequiredFields.length,
     dashboardConfig,
-    icdWorkspace.headers,
-    icdWorkspace.mapping,
-    icdWorkspace.rows,
-    icdWorkspace.hasDuplicateMapping,
-    icdWorkspace.missingRequiredFields.length,
+    sharedBeneficiaryConfigurationRows,
+    sharedIcdConfigurationRows,
   ]);
 
   function downloadDataResults() {
@@ -2009,21 +2548,15 @@ function CopayCalculator() {
 
   return (
     <div className="panel">
-      <section className="hero">
-        <div className="hero-card">
+      <section className="hero hero-compact">
+        <div className="hero-card hero-card-compact">
           <h2>Co-pay Calculator</h2>
           <p>
-            This tab mirrors the workbook logic. It derives relationship groups
-            from the beneficiary dimension, looks up ailments from ICD prefixes,
-            calculates workbook-style co-pay amounts, and summarizes totals for
-            ESC and Parent.
+            Load claim data to rebuild co-pay impact. Beneficiary mapping and ICD
+            mapping overrides are managed from the shared Configuration page.
           </p>
-          <div className="notice">
-            Row-level <code>Copay Existing</code> uses gross-up formulas from
-            the workbook. Dashboard existing limits are editable but separate.
-          </div>
         </div>
-        <div className="metric">
+        <div className="metric metric-compact">
           <div>
             <div className="metric-label">Grand Total Impact</div>
             <div
@@ -2034,12 +2567,44 @@ function CopayCalculator() {
               {formatNumber(copayResult.dashboard.grandTotalImpact, numberFormat)}
             </div>
           </div>
-          <p className="metric-copy">
-            Dashboard totals are the sum of <code>Copay New Suggested</code> by
-            relationship type, exactly like the workbook.
-          </p>
+          <p className="metric-copy">Grand total sums `Copay New Suggested` by relationship type.</p>
         </div>
       </section>
+
+      <FieldMappingCard
+        title="Claim Data Mapping"
+        description="Map the uploaded claim columns to the standard fields."
+        headers={claimsWorkspace.headers}
+        mapping={claimsWorkspace.mapping}
+        fieldDefs={COPAY_CLAIM_FIELD_DEFS}
+        onMappingChange={claimsWorkspace.setMapping}
+        showDuplicateNotice={claimsWorkspace.hasDuplicateMapping}
+      />
+
+      <DataEntryCard
+        title="Paste / Upload Claim Data"
+        description="Upload a claim file or paste the raw claim table directly."
+        workspace={claimsWorkspace}
+        fieldDefs={COPAY_CLAIM_FIELD_DEFS}
+        missingLabels={claimsWorkspace.missingRequiredFields.map((field) => field.label)}
+      />
+
+      <BeneficiaryConfigurationStatusCard
+        status={beneficiaryConfigurationState}
+        description="The co-pay run uses the beneficiary mapping loaded on the Configuration page."
+        actionLabel="Open Configuration"
+        onAction={onOpenConfiguration}
+        compact
+      />
+
+      <IcdConfigurationStatusCard
+        title="ICD Mapping Source"
+        description="The co-pay run always uses the built-in ICD master and, when valid, any custom overrides loaded on the Configuration page."
+        status={icdConfigurationState}
+        actionLabel="Open Configuration"
+        onAction={onOpenConfiguration}
+        compact
+      />
 
       <section className="card">
         <div className="field-grid">
@@ -2054,15 +2619,16 @@ function CopayCalculator() {
             </select>
           </div>
           <div className="info-card">
-            <div className="section-label">Default Existing Co-pay Formula</div>
+            <div className="section-label">Existing Co-pay Formula</div>
             <div className="muted">ESC = Incurred Amount x 10 / 90</div>
             <div className="muted">Parent = Incurred Amount x 20 / 80</div>
           </div>
           <div className="info-card">
             <div className="section-label">Validation Behavior</div>
             <div className="muted">
-              Missing relationship or ICD mappings stay in the run and show up
-              in the warnings table.
+              Missing ICD mappings stay in the run and appear in warnings. Beneficiary
+              mapping must be configured on the Configuration page before co-pay
+              calculation can run.
             </div>
           </div>
         </div>
@@ -2073,84 +2639,22 @@ function CopayCalculator() {
         setDashboardForm={setDashboardForm}
         numberFormat={numberFormat}
         dashboard={copayResult.dashboard}
-      />
-
-      <WorkspaceActionsCard
-        workspace={claimsWorkspace}
-        extraActions={[
-          { label: "Download Data CSV", onClick: downloadDataResults },
-          { label: "Download Dashboard CSV", onClick: downloadDashboardResults },
-        ]}
-      />
-
-      <FieldMappingCard
-        title="Claim Data Mapping"
-        description="Use the standard business names below. Older workbook headers are still accepted during upload."
-        headers={claimsWorkspace.headers}
-        mapping={claimsWorkspace.mapping}
-        fieldDefs={COPAY_CLAIM_FIELD_DEFS}
-        onMappingChange={claimsWorkspace.setMapping}
-        showDuplicateNotice={claimsWorkspace.hasDuplicateMapping}
-      />
-
-      <DataEntryCard
-        title="Claim Data"
-        description="Upload or paste the claim-level data using simple business names. Older workbook-style headers are still accepted in uploaded files."
-        workspace={claimsWorkspace}
-        fieldDefs={COPAY_CLAIM_FIELD_DEFS}
-        missingLabels={claimsWorkspace.missingRequiredFields.map((field) => field.label)}
-      />
-
-      <WorkspaceActionsCard workspace={beneficiaryWorkspace} />
-
-      <FieldMappingCard
-        title="Beneficiary Type Dimension Mapping"
-        description="Maps uploaded beneficiary relationships to Beneficiary Type Group2, which drives Relationship Group."
-        headers={beneficiaryWorkspace.headers}
-        mapping={beneficiaryWorkspace.mapping}
-        fieldDefs={BENEFICIARY_FIELD_DEFS}
-        onMappingChange={beneficiaryWorkspace.setMapping}
-        showDuplicateNotice={beneficiaryWorkspace.hasDuplicateMapping}
-      />
-
-      <DataEntryCard
-        title="Beneficiary Type Dimension"
-        description="Equivalent to the workbook lookup area in Lists!X:AA."
-        workspace={beneficiaryWorkspace}
-        fieldDefs={BENEFICIARY_FIELD_DEFS}
-        missingLabels={beneficiaryWorkspace.missingRequiredFields.map((field) => field.label)}
-      />
-
-      <WorkspaceActionsCard workspace={icdWorkspace} />
-
-      <FieldMappingCard
-        title="ICD / Ailment Mapping"
-        description="Maps the first 3 characters of ICD Code to the workbook ailment output."
-        headers={icdWorkspace.headers}
-        mapping={icdWorkspace.mapping}
-        fieldDefs={ICD_FIELD_DEFS}
-        onMappingChange={icdWorkspace.setMapping}
-        showDuplicateNotice={icdWorkspace.hasDuplicateMapping}
-      />
-
-      <DataEntryCard
-        title="ICD / Ailment Dimension"
-        description="Equivalent to the workbook lookup area in Lists!AJ:AL."
-        workspace={icdWorkspace}
-        fieldDefs={ICD_FIELD_DEFS}
-        missingLabels={icdWorkspace.missingRequiredFields.map((field) => field.label)}
+        actionLabel="Download Summary CSV"
+        onAction={downloadDashboardResults}
       />
 
       <section className="card">
         <div className="section-head">
           <div>
-            <h2>Calculated Data</h2>
+            <h2>Calculated Results</h2>
             <p className="muted">
-              Output columns follow the workbook order and include the
-              calculated relationship group, ailment, co-pay amounts, and final
-              relationship type.
+              Output follows the workbook order with relationship group, ailment,
+              co-pay amounts, and final relationship type.
             </p>
           </div>
+          <button type="button" className="secondary" onClick={downloadDataResults}>
+            Download Results CSV
+          </button>
         </div>
         <div className="table-wrap tall-table">
           <table>
@@ -2226,7 +2730,7 @@ function CopayCalculator() {
         </div>
       </section>
 
-  <WarningsCard warnings={copayResult.warnings} />
+      <WarningsCard warnings={copayResult.warnings} />
     </div>
   );
 }
@@ -2235,6 +2739,7 @@ function MaternityCalculator() {
   const workspace = useMappedWorkspace({
     sample: MATERNITY_CLAIM_SAMPLE,
     fieldDefs: MATERNITY_FIELD_DEFS,
+    normalizeInput: normalizeMaternityPasteText,
   });
   const [numberFormat, setNumberFormat] = useState("en-IN");
   const [dashboardForm, setDashboardForm] = useState(
@@ -2377,22 +2882,12 @@ function MaternityCalculator() {
 
   return (
     <div className="panel">
-      <section className="hero">
-        <div className="hero-card">
+      <section className="hero hero-compact">
+        <div className="hero-card hero-card-compact">
           <h2>Maternity</h2>
-          <p>
-            This tab rebuilds the workbook maternity sheet from claim-level
-            data. It filters settled maternity claims, groups them by employee
-            code, procedure type, and procedure limit, then applies the
-            workbook proposed and difference formulas.
-          </p>
-          <div className="notice">
-            Preferred filter: <code>Settlement Status = Settled</code> and
-            <code> Ailment = Maternity</code>. If ailment is missing, the tab
-            falls back to recognized maternity procedure types.
-          </div>
+          <p>Load claim data to rebuild the grouped maternity impact sheet.</p>
         </div>
-        <div className="metric">
+        <div className="metric metric-compact">
           <div>
             <div className="metric-label">Grand Total Impact</div>
             <div
@@ -2406,13 +2901,27 @@ function MaternityCalculator() {
               )}
             </div>
           </div>
-          <p className="metric-copy">
-            Dashboard totals are the sum of grouped
-            <code> Difference </code>
-            values for <code>Normal</code> and <code>C-section</code>.
-          </p>
+          <p className="metric-copy">Grand total is the sum of grouped `Difference` values.</p>
         </div>
       </section>
+
+      <FieldMappingCard
+        title="Field Mapping"
+        description="Map the uploaded claim columns used to build the maternity summary."
+        headers={workspace.headers}
+        mapping={workspace.mapping}
+        fieldDefs={MATERNITY_FIELD_DEFS}
+        onMappingChange={workspace.setMapping}
+        showDuplicateNotice={workspace.hasDuplicateMapping}
+      />
+
+      <DataEntryCard
+        title="Paste / Upload Data"
+        description="Upload claim data or paste the raw table directly."
+        workspace={workspace}
+        fieldDefs={MATERNITY_FIELD_DEFS}
+        missingLabels={workspace.missingRequiredFields.map((field) => field.label)}
+      />
 
       <section className="card">
         <div className="field-grid">
@@ -2427,18 +2936,14 @@ function MaternityCalculator() {
             </select>
           </div>
           <div className="info-card">
-            <div className="section-label">Fixed Claim Filter</div>
-            <div className="muted">Settlement Status must be Settled.</div>
-            <div className="muted">
-              Ailment should be Maternity when that column is available.
-            </div>
+            <div className="section-label">Claim Filter</div>
+            <div className="muted">Settlement Status should be `Settled`.</div>
+            <div className="muted">Ailment should be `Maternity` when available.</div>
           </div>
           <div className="info-card">
             <div className="section-label">Procedure Mapping</div>
-            <div className="muted">Normal maps to the Normal dashboard row.</div>
-            <div className="muted">
-              C-section, C-Section, and C section map to C-section.
-            </div>
+            <div className="muted">Normal maps to the Normal summary row.</div>
+            <div className="muted">C-section, C-Section, and C section map together.</div>
           </div>
         </div>
       </section>
@@ -2448,43 +2953,22 @@ function MaternityCalculator() {
         setDashboardForm={setDashboardForm}
         numberFormat={numberFormat}
         dashboard={maternityResult.dashboard}
-      />
-
-      <WorkspaceActionsCard
-        workspace={workspace}
-        extraActions={[
-          { label: "Download Data CSV", onClick: downloadDataResults },
-          { label: "Download Dashboard CSV", onClick: downloadDashboardResults },
-        ]}
-      />
-
-      <FieldMappingCard
-        title="Maternity Source Mapping"
-        description="Map the raw Data sheet columns used to build the workbook maternity summary."
-        headers={workspace.headers}
-        mapping={workspace.mapping}
-        fieldDefs={MATERNITY_FIELD_DEFS}
-        onMappingChange={workspace.setMapping}
-        showDuplicateNotice={workspace.hasDuplicateMapping}
-      />
-
-      <DataEntryCard
-        title="Maternity Source Data"
-        description="Upload or paste claim-level data. The calculator groups settled maternity rows by employee code, procedure type, and procedure limit."
-        workspace={workspace}
-        fieldDefs={MATERNITY_FIELD_DEFS}
-        missingLabels={workspace.missingRequiredFields.map((field) => field.label)}
+        actionLabel="Download Summary CSV"
+        onAction={downloadDashboardResults}
       />
 
       <section className="card">
         <div className="section-head">
           <div>
-            <h2>Calculated Maternity Sheet</h2>
+            <h2>Grouped Results</h2>
             <p className="muted">
-              Output follows the workbook layout: grouped rows with proposed
-              limit and calculated difference.
+              Output follows the workbook layout with grouped rows, proposed limit,
+              and calculated difference.
             </p>
           </div>
+          <button type="button" className="secondary" onClick={downloadDataResults}>
+            Download Results CSV
+          </button>
         </div>
         <div className="table-wrap tall-table">
           <table>
@@ -2723,21 +3207,12 @@ function RoomRentCalculator() {
 
   return (
     <div className="panel">
-      <section className="hero">
-        <div className="hero-card">
+      <section className="hero hero-compact">
+        <div className="hero-card hero-card-compact">
           <h2>Room Rent</h2>
-          <p>
-            This tab estimates room-rent impact using sum-insured-based caps for
-            Normal and ICU rooms. It supports either a total room-rent amount
-            or per-day room rent with days.
-          </p>
-          <div className="notice">
-            This is a practical room-rent model. It is claim-accurate only when
-            your uploaded data includes room category and room-rent charge
-            fields.
-          </div>
+          <p>Load settled claim data to estimate room-rent impact from SI-based caps.</p>
         </div>
-        <div className="metric">
+        <div className="metric metric-compact">
           <div>
             <div className="metric-label">Grand Total Impact</div>
             <div
@@ -2751,60 +3226,13 @@ function RoomRentCalculator() {
               )}
             </div>
           </div>
-          <p className="metric-copy">
-            Impact is calculated as proposed room-rent payable minus existing
-            room-rent payable.
-          </p>
+          <p className="metric-copy">Impact = proposed room-rent payable minus existing payable.</p>
         </div>
       </section>
-
-      <section className="card">
-        <div className="field-grid">
-          <div>
-            <label>Number Format</label>
-            <select
-              value={numberFormat}
-              onChange={(event) => setNumberFormat(event.target.value)}
-            >
-              <option value="en-IN">Indian</option>
-              <option value="en-US">International</option>
-            </select>
-          </div>
-          <div className="info-card">
-            <div className="section-label">Default Room Rent Caps</div>
-            <div className="muted">Normal: 1% to 2% of Sum Insured</div>
-            <div className="muted">ICU: 2% to 4% of Sum Insured</div>
-          </div>
-          <div className="info-card">
-            <div className="section-label">Amount Logic</div>
-            <div className="muted">
-              Uses total room-rent amount when present.
-            </div>
-            <div className="muted">
-              Otherwise uses room-rent per day times room days.
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <RoomRentDashboardConfigCard
-        dashboardForm={dashboardForm}
-        setDashboardForm={setDashboardForm}
-        numberFormat={numberFormat}
-        dashboard={roomRentResult.dashboard}
-      />
-
-      <WorkspaceActionsCard
-        workspace={workspace}
-        extraActions={[
-          { label: "Download Data CSV", onClick: downloadDataResults },
-          { label: "Download Dashboard CSV", onClick: downloadDashboardResults },
-        ]}
-      />
 
       <FieldMappingCard
-        title="Room Rent Source Mapping"
-        description="Map settled claim data to room category and room-rent charge fields."
+        title="Field Mapping"
+        description="Map the uploaded claim columns to room category and room-rent charge fields."
         headers={workspace.headers}
         mapping={workspace.mapping}
         fieldDefs={ROOM_RENT_FIELD_DEFS}
@@ -2819,22 +3247,59 @@ function RoomRentCalculator() {
       ) : null}
 
       <DataEntryCard
-        title="Room Rent Source Data"
-        description="Upload or paste claim-level data. The calculator only includes rows where Settlement Status is Settled."
+        title="Paste / Upload Data"
+        description="Upload claim data or paste the raw table directly."
         workspace={workspace}
         fieldDefs={ROOM_RENT_FIELD_DEFS}
         missingLabels={workspace.missingRequiredFields.map((field) => field.label)}
       />
 
       <section className="card">
+        <div className="field-grid">
+          <div>
+            <label>Number Format</label>
+            <select
+              value={numberFormat}
+              onChange={(event) => setNumberFormat(event.target.value)}
+            >
+              <option value="en-IN">Indian</option>
+              <option value="en-US">International</option>
+            </select>
+          </div>
+          <div className="info-card">
+            <div className="section-label">Default Caps</div>
+            <div className="muted">Normal: 1% to 2% of Sum Insured</div>
+            <div className="muted">ICU: 2% to 4% of Sum Insured</div>
+          </div>
+          <div className="info-card">
+            <div className="section-label">Amount Logic</div>
+            <div className="muted">Uses total room-rent amount when present.</div>
+            <div className="muted">Otherwise uses per-day rent multiplied by room days.</div>
+          </div>
+        </div>
+      </section>
+
+      <RoomRentDashboardConfigCard
+        dashboardForm={dashboardForm}
+        setDashboardForm={setDashboardForm}
+        numberFormat={numberFormat}
+        dashboard={roomRentResult.dashboard}
+        actionLabel="Download Summary CSV"
+        onAction={downloadDashboardResults}
+      />
+
+      <section className="card">
         <div className="section-head">
           <div>
-            <h2>Calculated Room Rent Impact</h2>
+            <h2>Claim-level Results</h2>
             <p className="muted">
               Each settled row shows actual room rent, existing and proposed
               cap amounts, payable amounts, and impact.
             </p>
           </div>
+          <button type="button" className="secondary" onClick={downloadDataResults}>
+            Download Results CSV
+          </button>
         </div>
         <div className="table-wrap tall-table">
           <table>
@@ -2925,6 +3390,7 @@ function CappedAilmentCalculator() {
   const workspace = useMappedWorkspace({
     sample: CAPPED_AILMENT_CLAIM_SAMPLE,
     fieldDefs: CAPPED_AILMENT_FIELD_DEFS,
+    normalizeInput: normalizeCappedAilmentPasteText,
   });
   const [numberFormat, setNumberFormat] = useState("en-IN");
   const [dashboardForm, setDashboardForm] = useState(
@@ -3047,22 +3513,12 @@ function CappedAilmentCalculator() {
 
   return (
     <div className="panel">
-      <section className="hero">
-        <div className="hero-card">
+      <section className="hero hero-compact">
+        <div className="hero-card hero-card-compact">
           <h2>Capped Ailment</h2>
-          <p>
-            This tab rebuilds the capped-ailment sheet from settled claim rows.
-            It groups by employee code, procedure type, and existing limit, and
-            then applies the workbook difference logic by configured ailment
-            type.
-          </p>
-          <div className="notice">
-            Psychiatric follows the special workbook rule:
-            <code> Proposed = Incurred Amount</code> and
-            <code> Difference = Incurred Amount</code>.
-          </div>
+          <p>Load settled claim data to rebuild the grouped capped-ailment impact sheet.</p>
         </div>
-        <div className="metric">
+        <div className="metric metric-compact">
           <div>
             <div className="metric-label">Grand Total Impact</div>
             <div
@@ -3076,13 +3532,27 @@ function CappedAilmentCalculator() {
               )}
             </div>
           </div>
-          <p className="metric-copy">
-            Dashboard totals are the sum of grouped
-            <code> Difference </code>
-            values by capped ailment type.
-          </p>
+          <p className="metric-copy">Grand total is the sum of grouped `Difference` values.</p>
         </div>
       </section>
+
+      <FieldMappingCard
+        title="Field Mapping"
+        description="Map the uploaded claim columns needed to build the capped ailment summary."
+        headers={workspace.headers}
+        mapping={workspace.mapping}
+        fieldDefs={CAPPED_AILMENT_FIELD_DEFS}
+        onMappingChange={workspace.setMapping}
+        showDuplicateNotice={workspace.hasDuplicateMapping}
+      />
+
+      <DataEntryCard
+        title="Paste / Upload Data"
+        description="Upload claim data or paste the raw table directly."
+        workspace={workspace}
+        fieldDefs={CAPPED_AILMENT_FIELD_DEFS}
+        missingLabels={workspace.missingRequiredFields.map((field) => field.label)}
+      />
 
       <section className="card">
         <div className="field-grid">
@@ -3098,21 +3568,13 @@ function CappedAilmentCalculator() {
           </div>
           <div className="info-card">
             <div className="section-label">Source Filter</div>
-            <div className="muted">
-              Only rows with Settlement Status = Settled are included.
-            </div>
-            <div className="muted">
-              Grouping key: Employee Code + Procedure Type + Procedure Limit.
-            </div>
+            <div className="muted">Only rows with `Settlement Status = Settled` are included.</div>
+            <div className="muted">Grouping key: Employee Code + Procedure Type + Procedure Limit.</div>
           </div>
           <div className="info-card">
             <div className="section-label">Procedure Matching</div>
-            <div className="muted">
-              Uses normalized procedure types such as TKR THR to TKR/THR.
-            </div>
-            <div className="muted">
-              Psychiatric can also fall back from ailment text.
-            </div>
+            <div className="muted">Uses normalized procedure types like TKR THR to TKR/THR.</div>
+            <div className="muted">Psychiatric can also fall back from ailment text.</div>
           </div>
         </div>
       </section>
@@ -3122,43 +3584,22 @@ function CappedAilmentCalculator() {
         setDashboardForm={setDashboardForm}
         numberFormat={numberFormat}
         dashboard={cappedAilmentResult.dashboard}
-      />
-
-      <WorkspaceActionsCard
-        workspace={workspace}
-        extraActions={[
-          { label: "Download Data CSV", onClick: downloadDataResults },
-          { label: "Download Dashboard CSV", onClick: downloadDashboardResults },
-        ]}
-      />
-
-      <FieldMappingCard
-        title="Capped Ailment Source Mapping"
-        description="Map the raw Data sheet columns needed to build the capped ailment summary."
-        headers={workspace.headers}
-        mapping={workspace.mapping}
-        fieldDefs={CAPPED_AILMENT_FIELD_DEFS}
-        onMappingChange={workspace.setMapping}
-        showDuplicateNotice={workspace.hasDuplicateMapping}
-      />
-
-      <DataEntryCard
-        title="Capped Ailment Source Data"
-        description="Upload or paste claim-level data. The calculator only includes settled rows with supported capped ailment procedure types."
-        workspace={workspace}
-        fieldDefs={CAPPED_AILMENT_FIELD_DEFS}
-        missingLabels={workspace.missingRequiredFields.map((field) => field.label)}
+        actionLabel="Download Summary CSV"
+        onAction={downloadDashboardResults}
       />
 
       <section className="card">
         <div className="section-head">
           <div>
-            <h2>Calculated Capped Ailment Sheet</h2>
+            <h2>Grouped Results</h2>
             <p className="muted">
               Output follows the grouped workbook structure with proposed limit
               and calculated difference.
             </p>
           </div>
+          <button type="button" className="secondary" onClick={downloadDataResults}>
+            Download Results CSV
+          </button>
         </div>
         <div className="table-wrap tall-table">
           <table>
@@ -3217,16 +3658,68 @@ function CappedAilmentCalculator() {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("sum-insured");
+  const beneficiaryConfigurationWorkspace = useMappedWorkspace({
+    sample: BENEFICIARY_TYPE_SAMPLE,
+    fieldDefs: BENEFICIARY_FIELD_DEFS,
+  });
+  const beneficiaryConfigurationState = useMemo(
+    () => getBeneficiaryConfigurationState(beneficiaryConfigurationWorkspace),
+    [
+      beneficiaryConfigurationWorkspace.headers,
+      beneficiaryConfigurationWorkspace.hasDuplicateMapping,
+      beneficiaryConfigurationWorkspace.missingRequiredFields,
+      beneficiaryConfigurationWorkspace.rows,
+    ],
+  );
+  const sharedBeneficiaryConfigurationRows = useMemo(() => {
+    if (beneficiaryConfigurationState.mode !== "ready") return [];
+
+    return mapRowsToObjects(
+      beneficiaryConfigurationWorkspace.rows,
+      beneficiaryConfigurationWorkspace.headers,
+      beneficiaryConfigurationWorkspace.mapping,
+      BENEFICIARY_FIELD_KEYS,
+    );
+  }, [
+    beneficiaryConfigurationState.mode,
+    beneficiaryConfigurationWorkspace.headers,
+    beneficiaryConfigurationWorkspace.mapping,
+    beneficiaryConfigurationWorkspace.rows,
+  ]);
+  const icdConfigurationWorkspace = useMappedWorkspace({
+    sample: ICD_AILMENT_SAMPLE,
+    fieldDefs: ICD_FIELD_DEFS,
+    normalizeInput: normalizeIcdPasteText,
+  });
+  const icdConfigurationState = useMemo(
+    () => getIcdConfigurationState(icdConfigurationWorkspace),
+    [
+      icdConfigurationWorkspace.headers,
+      icdConfigurationWorkspace.hasDuplicateMapping,
+      icdConfigurationWorkspace.missingRequiredFields,
+      icdConfigurationWorkspace.rows,
+    ],
+  );
+  const sharedIcdConfigurationRows = useMemo(() => {
+    if (icdConfigurationState.mode !== "custom") return [];
+
+    return mapRowsToObjects(
+      icdConfigurationWorkspace.rows,
+      icdConfigurationWorkspace.headers,
+      icdConfigurationWorkspace.mapping,
+      ICD_FIELD_KEYS,
+    );
+  }, [
+    icdConfigurationState.mode,
+    icdConfigurationWorkspace.headers,
+    icdConfigurationWorkspace.mapping,
+    icdConfigurationWorkspace.rows,
+  ]);
 
   return (
     <div className="page">
       <header className="page-header">
-        <p className="eyebrow">Insurance Calculators</p>
         <h1>Claims Scenario Workbench</h1>
-        <p className="page-copy">
-          Switch between calculators without leaving the page. Each tab keeps
-          its own uploaded data, mappings, and scenario inputs.
-        </p>
       </header>
 
       <PageTabs activeTab={activeTab} setActiveTab={setActiveTab} />
@@ -3239,7 +3732,25 @@ export default function App() {
       </section>
 
       <section hidden={activeTab !== "copay"} aria-hidden={activeTab !== "copay"}>
-        <CopayCalculator />
+        <CopayCalculator
+          beneficiaryConfigurationState={beneficiaryConfigurationState}
+          sharedBeneficiaryConfigurationRows={sharedBeneficiaryConfigurationRows}
+          icdConfigurationState={icdConfigurationState}
+          sharedIcdConfigurationRows={sharedIcdConfigurationRows}
+          onOpenConfiguration={() => setActiveTab("configuration")}
+        />
+      </section>
+
+      <section
+        hidden={activeTab !== "configuration"}
+        aria-hidden={activeTab !== "configuration"}
+      >
+        <ConfigurationPage
+          beneficiaryWorkspace={beneficiaryConfigurationWorkspace}
+          beneficiaryConfigurationState={beneficiaryConfigurationState}
+          icdWorkspace={icdConfigurationWorkspace}
+          icdConfigurationState={icdConfigurationState}
+        />
       </section>
 
       <section

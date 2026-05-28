@@ -1,3 +1,5 @@
+import { DEFAULT_ICD_LOOKUP_ROWS } from "./icdDefaults";
+
 export const SUM_INSURED_REQUIRED = [
   "Employee ID",
   "Claim Status",
@@ -359,6 +361,26 @@ function calculateMaternityDifference({
 export function parseCSV(text) {
   if (!text) return [];
 
+  let delimiter = ",";
+  let quoteScan = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+
+    if (char === '"' && quoteScan && next === '"') {
+      index += 1;
+    } else if (char === '"') {
+      quoteScan = !quoteScan;
+    } else if (char === "\t" && !quoteScan) {
+      delimiter = "\t";
+      break;
+    } else if ((char === "\n" || char === "\r") && !quoteScan) {
+      // Delimiter is chosen from the first non-quoted row.
+      break;
+    }
+  }
+
   const rows = [];
   let row = [];
   let cell = "";
@@ -373,7 +395,7 @@ export function parseCSV(text) {
       index += 1;
     } else if (char === '"') {
       inQuotes = !inQuotes;
-    } else if ((char === "," || char === "\t") && !inQuotes) {
+    } else if (char === delimiter && !inQuotes) {
       row.push(cell);
       cell = "";
     } else if ((char === "\n" || char === "\r") && !inQuotes) {
@@ -391,6 +413,45 @@ export function parseCSV(text) {
   if (row.some(Boolean)) rows.push(row.map((value) => value.trim()));
 
   return rows;
+}
+
+function escapeCSVCell(value) {
+  const text = String(value ?? "");
+  if (/[",\n\r]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+}
+
+function spreadsheetCellToText(value) {
+  if (value === null || value === undefined) return "";
+
+  if (value instanceof Date) {
+    if (Number.isNaN(value.valueOf())) return "";
+    return value.toISOString().slice(0, 10);
+  }
+
+  return String(value);
+}
+
+export function workbookSheetsToCSV(sheets) {
+  const firstPopulatedSheet = Array.isArray(sheets)
+    ? sheets.find(
+        (sheet) =>
+          Array.isArray(sheet?.data) &&
+          sheet.data.some(
+            (row) =>
+              Array.isArray(row) &&
+              row.some((cell) => spreadsheetCellToText(cell).trim() !== ""),
+          ),
+      )
+    : null;
+
+  if (!firstPopulatedSheet) return "";
+
+  return firstPopulatedSheet.data
+    .map((row) => row.map((cell) => escapeCSVCell(spreadsheetCellToText(cell))).join(","))
+    .join("\n");
 }
 
 export function normalizeText(value) {
@@ -460,17 +521,36 @@ export function buildBeneficiaryTypeMap(beneficiaryTypeRows) {
 export function buildIcdAilmentMap(icdRows) {
   const map = new Map();
 
-  icdRows.forEach((row) => {
-    const key = normalizeKey(row.icdPrefix);
-    if (!key) return;
+  [...DEFAULT_ICD_LOOKUP_ROWS, ...(icdRows || [])].forEach((row) => {
+    const key = normalizeIcdCodeKey(row.icdPrefix);
+    const ailment = normalizeText(row.ailment);
+    if (!key || !ailment) return;
 
     map.set(key, {
       icdPrefix: normalizeText(row.icdPrefix),
-      ailment: normalizeText(row.ailment),
+      category: normalizeText(row.category),
+      ailment,
     });
   });
 
   return map;
+}
+
+function normalizeIcdCodeKey(value) {
+  return normalizeText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function findIcdAilmentMatch(icdCode, icdAilmentMap) {
+  const compactIcdCode = normalizeIcdCodeKey(icdCode);
+
+  for (let index = compactIcdCode.length; index >= 3; index -= 1) {
+    const match = icdAilmentMap.get(compactIcdCode.slice(0, index));
+    if (match) return match;
+  }
+
+  return null;
 }
 
 export function calculateSumInsured(
@@ -630,17 +710,16 @@ export function calculateCopayRows(
 
     const relationshipType = getCopayRelationshipType(relationshipGroup);
 
-    const icdPrefix = icdCode.slice(0, 3);
-    const ailmentMatch = icdAilmentMap.get(normalizeKey(icdPrefix));
+    const ailmentMatch = findIcdAilmentMatch(icdCode, icdAilmentMap);
     const ailment = ailmentMatch?.ailment || "";
 
-    if (!ailmentMatch && icdPrefix) {
+    if (!ailmentMatch && icdCode) {
       rowWarnings.push(
         makeWarning(
           rowNumber,
           employeeCode,
           "icdCode",
-          "ICD prefix not found in ailment mapping.",
+          "ICD code not found in ailment mapping.",
         ),
       );
     }

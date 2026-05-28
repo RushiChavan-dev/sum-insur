@@ -29,3 +29,19 @@ For a manual direct upload deploy from your machine:
 ```bash
 npm run deploy:cloudflare
 ```
+
+### Cloudflare Workers
+
+If your Cloudflare project is using a deploy command such as `npx wrangler deploy`,
+this repo now includes a `wrangler.jsonc` for static SPA deployment.
+
+Use these settings:
+
+- Build command: `npm run build`
+- Deploy command: `npx wrangler deploy`
+
+For a local deploy:
+
+```bash
+npm run deploy
+```

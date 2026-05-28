@@ -11,7 +11,230 @@ import {
   calculateSumInsured,
   mapRowsToObjects,
   parseCSV,
+  workbookSheetsToCSV,
 } from "./lib";
+import {
+  COPAY_CLAIM_FIELD_DEFS,
+  ICD_FIELD_DEFS,
+  SUM_INSURED_FIELD_DEFS,
+  buildDefaultMapping,
+  getAutoMappedMissingRequiredFields,
+  getRowValidationIssues,
+  MATERNITY_FIELD_DEFS,
+  ROOM_RENT_FIELD_DEFS,
+  prepareRowsForFieldMapping,
+} from "./headerMappings";
+import { DEFAULT_ICD_LOOKUP_ROWS } from "./icdDefaults";
+
+describe("parseCSV", () => {
+  it("treats Excel-pasted tab-separated rows as TSV even when numbers contain commas", () => {
+    const text = `Employee ID\tCurrent Sum Insured\tClaimed Amount\tIncurred Amount\tNew Proposed Sum Insured
+722489\t500000\t771,001\t465,732\t300,000
+729536\t500000\t969,782\t384,596\t300,000`;
+
+    expect(parseCSV(text)).toEqual([
+      [
+        "Employee ID",
+        "Current Sum Insured",
+        "Claimed Amount",
+        "Incurred Amount",
+        "New Proposed Sum Insured",
+      ],
+      ["722489", "500000", "771,001", "465,732", "300,000"],
+      ["729536", "500000", "969,782", "384,596", "300,000"],
+    ]);
+  });
+
+  it("still parses quoted CSV values that contain commas", () => {
+    const text = `Employee ID,Claimed Amount,Notes
+722489,"771,001","Paid, reviewed"`;
+
+    expect(parseCSV(text)).toEqual([
+      ["Employee ID", "Claimed Amount", "Notes"],
+      ["722489", "771,001", "Paid, reviewed"],
+    ]);
+  });
+});
+
+describe("workbookSheetsToCSV", () => {
+  it("serializes the first populated sheet for direct xlsx uploads", () => {
+    const text = workbookSheetsToCSV([
+      { sheet: "Intro", data: [] },
+      {
+        sheet: "Claims",
+        data: [
+          ["Employee ID", "Claimed Amount", "Risk Start Date"],
+          ["722489", 771001, new Date("2023-12-24T00:00:00.000Z")],
+          ["729536", 969782, null],
+        ],
+      },
+    ]);
+
+    expect(parseCSV(text)).toEqual([
+      ["Employee ID", "Claimed Amount", "Risk Start Date"],
+      ["722489", "771001", "2023-12-24"],
+      ["729536", "969782", ""],
+    ]);
+  });
+});
+
+describe("prepareRowsForFieldMapping", () => {
+  it("finds a header row within the first 20 rows using shared aliases", () => {
+    const rows = [
+      ["Maternity claim dump"],
+      ["Generated on", "2026-05-28"],
+      [
+        "employee_code",
+        "Proc Type",
+        "Proc Limit",
+        "ARG Claimed Amount",
+        "ARG Incurred Amount",
+        "ARG Status1",
+      ],
+      ["EMP001", "C-Section", "100000", "169836", "100000", "Settled"],
+    ];
+
+    const prepared = prepareRowsForFieldMapping(rows, MATERNITY_FIELD_DEFS);
+
+    expect(prepared.found).toBe(true);
+    expect(prepared.headerRowIndex).toBe(2);
+    expect(prepared.headers).toEqual(rows[2]);
+    expect(prepared.rows).toEqual(rows.slice(2));
+    expect(prepared.missingRequiredFields).toEqual([]);
+  });
+
+  it("reports missing required fields when no usable header row is found", () => {
+    const rows = [
+      ["Room rent analysis"],
+      ["Prepared by operations"],
+      ["foo", "bar", "baz"],
+    ];
+
+    const prepared = prepareRowsForFieldMapping(rows, ROOM_RENT_FIELD_DEFS);
+
+    expect(prepared.found).toBe(false);
+    expect(prepared.missingRequiredFields.map((field) => field.label)).toEqual([
+      "Employee Code",
+      "Sum Insured",
+      "Settlement Status",
+    ]);
+  });
+});
+
+describe("shared header mappings", () => {
+  it("maps sum insured workbook headers with employee_code and summed amount labels", () => {
+    const headers = [
+      "employee_code",
+      "Sum Insured",
+      "Sum of ARG Claimed Amount",
+      "Sum of ARG Incurred Amount",
+    ];
+
+    const mapping = buildDefaultMapping(headers, SUM_INSURED_FIELD_DEFS);
+
+    expect(mapping["Employee ID"]).toBe("employee_code");
+    expect(mapping["Current Sum Insured"]).toBe("Sum Insured");
+    expect(mapping["Claimed Amount"]).toBe("Sum of ARG Claimed Amount");
+    expect(mapping["Incurred Amount"]).toBe("Sum of ARG Incurred Amount");
+    expect(mapping["Claim Status"]).toBe("");
+  });
+
+  it("maps the copay workbook headers you provided without missing required fields", () => {
+    const headers = [
+      "Sum Insured",
+      "ARG Relation",
+      "ARG Relation Group1",
+      "ARG Age",
+      "ARG Claimed Amount",
+      "ARG Incurred Amount",
+      "ARG Claim Type",
+      "IPD/OPD",
+      "ARG Status",
+      "ARG Status1",
+      "ARG ICD",
+      "ARG Ailment",
+      "Proc Type",
+      "Proc Limit",
+      "Grade",
+      "policy_no",
+      "mph_name",
+      "risk_inc_date",
+      "risk_exp_date",
+      "employee_code",
+      "Co-pay Existing",
+      "Copay New Sugg",
+      "Rel Type",
+    ];
+
+    const missingRequiredFields = getAutoMappedMissingRequiredFields(
+      headers,
+      COPAY_CLAIM_FIELD_DEFS,
+    );
+
+    expect(missingRequiredFields).toEqual([]);
+  });
+
+  it("maps ICD start code dimension headers after a title row", () => {
+    const rows = [
+      ["ICD10 Start Code Dimension List"],
+      [
+        "ICD Start Code",
+        "ICD Start Code Classification",
+        "Group Diagnosis1",
+        "Group Diagnosis2",
+      ],
+      [
+        "H25",
+        "Diseases of the eye and adnexa",
+        "Eye",
+        "Senile cataract",
+      ],
+    ];
+
+    const prepared = prepareRowsForFieldMapping(rows, ICD_FIELD_DEFS);
+    const mapping = buildDefaultMapping(prepared.headers, ICD_FIELD_DEFS);
+
+    expect(prepared.found).toBe(true);
+    expect(prepared.headerRowIndex).toBe(1);
+    expect(prepared.missingRequiredFields).toEqual([]);
+    expect(mapping.icdPrefix).toBe("ICD Start Code");
+    expect(mapping.category).toBe("ICD Start Code Classification");
+    expect(mapping.ailment).toBe("Group Diagnosis1");
+  });
+
+  it("flags incomplete or unexpected rows in the editable preview", () => {
+    const headers = [
+      "employee_code",
+      "Sum Insured",
+      "Sum of ARG Claimed Amount",
+      "Sum of ARG Incurred Amount",
+    ];
+    const mapping = buildDefaultMapping(headers, SUM_INSURED_FIELD_DEFS);
+
+    expect(
+      getRowValidationIssues(
+        ["EMP001", "500000", "700000", ""],
+        headers,
+        SUM_INSURED_FIELD_DEFS,
+        mapping,
+      ),
+    ).toContain("Incurred Amount is missing");
+
+    expect(
+      getRowValidationIssues(
+        ["EMP001", "five lakh", "700000", "450000", "extra value"],
+        headers,
+        SUM_INSURED_FIELD_DEFS,
+        mapping,
+      ),
+    ).toEqual(
+      expect.arrayContaining([
+        "Current Sum Insured should be numeric",
+        "Unexpected extra values found in the row",
+      ]),
+    );
+  });
+});
 
 describe("calculateSumInsured", () => {
   it("calculates expected impact for sample", () => {
@@ -37,6 +260,22 @@ describe("calculateSumInsured", () => {
 
     expect(parsed.length).toBe(1);
     expect(grandTotal).toBe(-165732);
+  });
+});
+
+describe("DEFAULT_ICD_LOOKUP_ROWS", () => {
+  it("covers representative ICD prefixes from the built-in master list", () => {
+    const lookup = new Map(
+      DEFAULT_ICD_LOOKUP_ROWS.map((row) => [row.icdPrefix, row]),
+    );
+
+    expect(lookup.get("A00")?.ailment).toBe("Infectious");
+    expect(lookup.get("H25")?.ailment).toBe("Eye");
+    expect(lookup.get("H99")?.ailment).toBe("Ear & Mastoid");
+    expect(lookup.get("O82")?.ailment).toBe("Maternity");
+    expect(lookup.get("S22")?.ailment).toBe("Accident / Injury");
+    expect(lookup.get("U07")?.ailment).toBe("Covid-19");
+    expect(lookup.get("Z99")?.ailment).toBe("Factors influencing health status");
   });
 });
 
@@ -153,9 +392,258 @@ H25,Ophthalmology,Eye`;
     expect(result.warnings).toHaveLength(0);
   });
 
+  it("matches full ICD codes against exact rows and broader prefixes", () => {
+    const claimText = `Sum Insured,ARG Relation,ARG Age,ARG Claimed Amount,ARG Incurred Amount,ARG Claim Type,IPD/OPD,ARG Status,ARG Status1,ARG ICD,Proc Type,Proc Limit,policy_no,mph_name,risk_inc_date,risk_exp_date,employee_code
+500000,Self,34,771001,465732,Cashless,IPD,Settled,Settled,H25.011,Cataract,50000,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000123
+500000,Mother,62,92015,80000,Cashless,IPD,Settled,Settled,K42.9,Hernia,40000,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000124
+500000,Father,58,605269,300000,Reimbursement,IPD,Settled,Settled,M17.12,TKR/THR,150000,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000125
+500000,Spouse,30,113860,80310,Cashless,IPD,Settled,Settled,O82.0,C-Section,100000,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000126`;
+    const beneficiaryText = `Beneficiary Type,Beneficiary Type Group2
+Self,Employee
+Mother,Parent
+Father,Parent
+Spouse,Spouse`;
+    const icdText = `ICD Prefix,Category,Ailment
+H25.011,Ophthalmology,Eye
+K42,General Surgery,Digestive
+M17,Orthopedics,Musculoskeletal
+O82,Obstetrics,Maternity`;
+
+    const claimRows = parseCSV(claimText);
+    const beneficiaryRows = parseCSV(beneficiaryText);
+    const icdRows = parseCSV(icdText);
+
+    const result = calculateCopayWorkbook({
+      claimRows: mapRowsToObjects(
+        claimRows,
+        claimRows[0],
+        {
+          sumInsured: "Sum Insured",
+          relationship: "ARG Relation",
+          age: "ARG Age",
+          claimedAmount: "ARG Claimed Amount",
+          incurredAmount: "ARG Incurred Amount",
+          claimType: "ARG Claim Type",
+          admissionType: "IPD/OPD",
+          claimStatus: "ARG Status",
+          settlementStatus: "ARG Status1",
+          icdCode: "ARG ICD",
+          procedureType: "Proc Type",
+          procedureLimit: "Proc Limit",
+          policyNumber: "policy_no",
+          clientName: "mph_name",
+          riskStartDate: "risk_inc_date",
+          riskEndDate: "risk_exp_date",
+          employeeCode: "employee_code",
+        },
+        [
+          "sumInsured",
+          "relationship",
+          "age",
+          "claimedAmount",
+          "incurredAmount",
+          "claimType",
+          "admissionType",
+          "claimStatus",
+          "settlementStatus",
+          "icdCode",
+          "procedureType",
+          "procedureLimit",
+          "policyNumber",
+          "clientName",
+          "riskStartDate",
+          "riskEndDate",
+          "employeeCode",
+        ],
+      ),
+      beneficiaryTypeRows: mapRowsToObjects(
+        beneficiaryRows,
+        beneficiaryRows[0],
+        {
+          beneficiaryType: "Beneficiary Type",
+          beneficiaryTypeGroup2: "Beneficiary Type Group2",
+        },
+        ["beneficiaryType", "beneficiaryTypeGroup2"],
+      ),
+      icdRows: mapRowsToObjects(
+        icdRows,
+        icdRows[0],
+        {
+          icdPrefix: "ICD Prefix",
+          ailment: "Ailment",
+        },
+        ["icdPrefix", "ailment"],
+      ),
+    });
+
+    expect(result.rows.map((row) => row.ailment)).toEqual([
+      "Eye",
+      "Digestive",
+      "Musculoskeletal",
+      "Maternity",
+    ]);
+    expect(result.warnings).toHaveLength(0);
+  });
+
+  it("covers the built-in ICD master list across chapters when no custom ICD upload is provided", () => {
+    const claimText = `Sum Insured,ARG Relation,ARG Age,ARG Claimed Amount,ARG Incurred Amount,ARG Claim Type,IPD/OPD,ARG Status,ARG Status1,ARG ICD,Proc Type,Proc Limit,policy_no,mph_name,risk_inc_date,risk_exp_date,employee_code
+500000,Self,34,5000,4500,Cashless,IPD,Settled,Settled,A09.0,Consultation,0,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000123
+500000,Self,34,771001,465732,Cashless,IPD,Settled,Settled,H25.011,Cataract,50000,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000124
+500000,Father,58,605269,300000,Reimbursement,IPD,Settled,Settled,I21.9,Treatment,0,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000125
+500000,Spouse,30,113860,80310,Cashless,IPD,Settled,Settled,O82.0,C-Section,100000,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000126
+500000,Self,34,15000,15000,Cashless,IPD,Settled,Settled,U07.1,Isolation,0,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000127`;
+    const beneficiaryText = `Beneficiary Type,Beneficiary Type Group2
+Self,Employee
+Father,Parent
+Spouse,Spouse`;
+
+    const claimRows = parseCSV(claimText);
+    const beneficiaryRows = parseCSV(beneficiaryText);
+
+    const result = calculateCopayWorkbook({
+      claimRows: mapRowsToObjects(
+        claimRows,
+        claimRows[0],
+        {
+          sumInsured: "Sum Insured",
+          relationship: "ARG Relation",
+          age: "ARG Age",
+          claimedAmount: "ARG Claimed Amount",
+          incurredAmount: "ARG Incurred Amount",
+          claimType: "ARG Claim Type",
+          admissionType: "IPD/OPD",
+          claimStatus: "ARG Status",
+          settlementStatus: "ARG Status1",
+          icdCode: "ARG ICD",
+          procedureType: "Proc Type",
+          procedureLimit: "Proc Limit",
+          policyNumber: "policy_no",
+          clientName: "mph_name",
+          riskStartDate: "risk_inc_date",
+          riskEndDate: "risk_exp_date",
+          employeeCode: "employee_code",
+        },
+        [
+          "sumInsured",
+          "relationship",
+          "age",
+          "claimedAmount",
+          "incurredAmount",
+          "claimType",
+          "admissionType",
+          "claimStatus",
+          "settlementStatus",
+          "icdCode",
+          "procedureType",
+          "procedureLimit",
+          "policyNumber",
+          "clientName",
+          "riskStartDate",
+          "riskEndDate",
+          "employeeCode",
+        ],
+      ),
+      beneficiaryTypeRows: mapRowsToObjects(
+        beneficiaryRows,
+        beneficiaryRows[0],
+        {
+          beneficiaryType: "Beneficiary Type",
+          beneficiaryTypeGroup2: "Beneficiary Type Group2",
+        },
+        ["beneficiaryType", "beneficiaryTypeGroup2"],
+      ),
+      icdRows: [],
+    });
+
+    expect(result.rows.map((row) => row.ailment)).toEqual([
+      "Infectious",
+      "Eye",
+      "Circulatory",
+      "Maternity",
+      "Covid-19",
+    ]);
+    expect(result.warnings).toHaveLength(0);
+  });
+
+  it("lets uploaded ICD rows override the built-in ICD master list", () => {
+    const claimText = `Sum Insured,ARG Relation,ARG Age,ARG Claimed Amount,ARG Incurred Amount,ARG Claim Type,IPD/OPD,ARG Status,ARG Status1,ARG ICD,Proc Type,Proc Limit,policy_no,mph_name,risk_inc_date,risk_exp_date,employee_code
+500000,Self,34,771001,465732,Cashless,IPD,Settled,Settled,H25.011,Cataract,50000,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000123`;
+    const beneficiaryText = `Beneficiary Type,Beneficiary Type Group2
+Self,Employee`;
+    const icdText = `ICD Prefix,Category,Ailment
+H25,Custom Eye Group,Vision Override`;
+
+    const result = calculateCopayWorkbook({
+      claimRows: mapRowsToObjects(
+        parseCSV(claimText),
+        parseCSV(claimText)[0],
+        {
+          sumInsured: "Sum Insured",
+          relationship: "ARG Relation",
+          age: "ARG Age",
+          claimedAmount: "ARG Claimed Amount",
+          incurredAmount: "ARG Incurred Amount",
+          claimType: "ARG Claim Type",
+          admissionType: "IPD/OPD",
+          claimStatus: "ARG Status",
+          settlementStatus: "ARG Status1",
+          icdCode: "ARG ICD",
+          procedureType: "Proc Type",
+          procedureLimit: "Proc Limit",
+          policyNumber: "policy_no",
+          clientName: "mph_name",
+          riskStartDate: "risk_inc_date",
+          riskEndDate: "risk_exp_date",
+          employeeCode: "employee_code",
+        },
+        [
+          "sumInsured",
+          "relationship",
+          "age",
+          "claimedAmount",
+          "incurredAmount",
+          "claimType",
+          "admissionType",
+          "claimStatus",
+          "settlementStatus",
+          "icdCode",
+          "procedureType",
+          "procedureLimit",
+          "policyNumber",
+          "clientName",
+          "riskStartDate",
+          "riskEndDate",
+          "employeeCode",
+        ],
+      ),
+      beneficiaryTypeRows: mapRowsToObjects(
+        parseCSV(beneficiaryText),
+        parseCSV(beneficiaryText)[0],
+        {
+          beneficiaryType: "Beneficiary Type",
+          beneficiaryTypeGroup2: "Beneficiary Type Group2",
+        },
+        ["beneficiaryType", "beneficiaryTypeGroup2"],
+      ),
+      icdRows: mapRowsToObjects(
+        parseCSV(icdText),
+        parseCSV(icdText)[0],
+        {
+          icdPrefix: "ICD Prefix",
+          category: "Category",
+          ailment: "Ailment",
+        },
+        ["icdPrefix", "category", "ailment"],
+      ),
+    });
+
+    expect(result.rows[0].ailment).toBe("Vision Override");
+    expect(result.warnings).toHaveLength(0);
+  });
+
   it("creates row-level warnings for missing lookups and invalid numerics", () => {
     const claimText = `Sum Insured,ARG Relation,ARG Age,ARG Claimed Amount,ARG Incurred Amount,ARG Claim Type,IPD/OPD,ARG Status,ARG Status1,ARG ICD,Proc Type,Proc Limit,policy_no,mph_name,risk_inc_date,risk_exp_date,employee_code
-bad,Unknown,abc,,foo,Cashless,IPD,Settled,Settled,Z99.999,Cataract,,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000126`;
+bad,Unknown,abc,,foo,Cashless,IPD,Settled,Settled,U99.999,Cataract,,POL001,Acme Ltd,24-Dec-23,23-Dec-24,000126`;
     const beneficiaryText = `Beneficiary Type,Beneficiary Type Group2
 Self,Employee`;
     const icdText = `ICD Prefix,Ailment
@@ -238,7 +726,7 @@ H25,Eye`;
     expect(result.rows[0].copayExisting).toBe(0);
     expect(result.rows[0].copayNewSuggested).toBe(0);
     expect(result.warnings.some((warning) => warning.message.includes("Relationship not found"))).toBe(true);
-    expect(result.warnings.some((warning) => warning.message.includes("ICD prefix not found"))).toBe(true);
+    expect(result.warnings.some((warning) => warning.message.includes("ICD code not found"))).toBe(true);
     expect(result.warnings.some((warning) => warning.message.includes("Used 0"))).toBe(true);
   });
 
