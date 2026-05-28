@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "deploy:cloudflare": "npm run build && npx wrangler pages deploy dist",
     "preview": "vite preview",
     "test": "vitest"
   },
